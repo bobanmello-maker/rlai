@@ -1,4 +1,6 @@
 requests>=2.31.0
 numpy>=1.24.0
-# boxcars-py na PyPI trenutno samo 0.1.0 — heatmap best-effort
-boxcars-py==0.1.0
+# Zvanicni boxcars-py na PyPI je zastareo (0.1.0, iz 2020) i ne parsira header
+# novijih replay-a (StructProperty greske). sprocket-boxcars-py je aktivno
+# odrzavan fork (isti modul za import: boxcars_py) — koristi njega.
+sprocket-boxcars-py
