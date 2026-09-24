@@ -61,21 +61,38 @@ def bc_get(path: str, timeout: int = 60) -> requests.Response:
     return r
 
 
-def host_get(path: str) -> Any:
+HOST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def host_get(path: str, retries: int = 3) -> Any:
     url = f"{HOST}{path}"
-    r = requests.get(url, params={"token": UPLOAD_TOKEN}, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, params={"token": UPLOAD_TOKEN}, timeout=60, headers=HOST_HEADERS)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            log(f"  host_get attempt {attempt}/{retries} failed: {e}")
+            if attempt < retries:
+                time.sleep(5 * attempt)  # 5s, 10s backoff
+    raise last_err  # type: ignore[misc]
 
 
 def host_post(path: str, payload: dict) -> Any:
     url = f"{HOST}{path}"
+    headers = {**HOST_HEADERS, "Content-Type": "application/json"}
     r = requests.post(
         url,
         params={"token": UPLOAD_TOKEN},
         json=payload,
         timeout=120,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     if r.status_code >= 400:
         raise RuntimeError(f"Host POST {path} → {r.status_code}: {r.text[:400]}")
