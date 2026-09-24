@@ -35,7 +35,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install "requests>=2.31.0" "numpy>=1.24.0"
           # boxcars opciono — ako pip padne, worker i dalje radi (Ballchasing details + mistakes)
-          pip install "boxcars-py==0.1.0" || echo "WARN: boxcars-py install failed — continuing without frame heatmaps"
+          # sprocket-boxcars-py je aktivno odrzavan fork zvanicnog (napustenog) boxcars-py;
+          # resava StructProperty greske na novijim replay-ima. Import modul ostaje boxcars_py.
+          pip install "sprocket-boxcars-py" || echo "WARN: boxcars-py install failed — continuing without frame heatmaps"
 
       - name: Run worker
         env:
