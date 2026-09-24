@@ -13,6 +13,10 @@ on:
         description: "Koliko replay-a u ovom runu (max 200, preporuka 180)"
         required: false
         default: "180"
+      reprocess_empty:
+        description: "Ponovo obradi mečeve bez heatmap/frame podataka (1=da)"
+        required: false
+        default: "1"
 
 jobs:
   process:
@@ -34,10 +38,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install "requests>=2.31.0" "numpy>=1.24.0"
-          # boxcars opciono — ako pip padne, worker i dalje radi (Ballchasing details + mistakes)
-          # sprocket-boxcars-py je aktivno odrzavan fork zvanicnog (napustenog) boxcars-py;
-          # resava StructProperty greske na novijim replay-ima. Import modul ostaje boxcars_py.
-          pip install "sprocket-boxcars-py" || echo "WARN: boxcars-py install failed — continuing without frame heatmaps"
+          # Package name != import name: sprocket-boxcars-py → module sprocket_boxcars_py
+          pip install "sprocket-boxcars-py>=0.3.0" || pip install "boxcars-py==0.1.0" || echo "WARN: no boxcars package — heatmaps disabled"
+          python - <<'PY'
+          import importlib, pkgutil
+          found = [m.name for m in pkgutil.iter_modules() if "box" in m.name.lower() or "sprocket" in m.name.lower()]
+          print("candidate modules:", found)
+          ok = False
+          for name in ("sprocket_boxcars_py", "boxcars_py", "boxcars"):
+              try:
+                  m = importlib.import_module(name)
+                  fn = getattr(m, "parse_replay", None) or getattr(m, "parse", None)
+                  print(f"{name}: OK parse_replay={callable(fn)} file={getattr(m,'__file__',None)}")
+                  ok = ok or callable(fn)
+              except Exception as e:
+                  print(f"{name}: FAIL {e}")
+          if not ok:
+              raise SystemExit("ERROR: no usable boxcars parser — heatmaps will be empty")
+          PY
 
       - name: Run worker
         env:
@@ -45,6 +63,7 @@ jobs:
           HOST_BASE_URL: ${{ secrets.HOST_BASE_URL }}
           UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size || '180' }}
+          REPROCESS_EMPTY: ${{ github.event.inputs.reprocess_empty || '1' }}
         run: |
           python phase3/worker/worker.py
 
