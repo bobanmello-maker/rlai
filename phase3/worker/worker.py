@@ -82,33 +82,47 @@ def parse_replay_dict(raw: bytes, replay_path: Path | None = None) -> dict:
     errors: list[str] = []
 
     if HAS_RRROCKET and RRROCKET_BIN:
-        path = replay_path
+        path: Path | None = Path(replay_path) if replay_path else None
         tmp_created = False
+        out_json: Path | None = None
         try:
-            if path is None or not Path(path).exists():
+            if path is None or not path.exists():
                 path = TMP / f"_parse_{os.getpid()}_{int(time.time() * 1000)}.replay"
                 path.write_bytes(raw)
                 tmp_created = True
-            proc = subprocess.run(
-                [RRROCKET_BIN, "-n", str(path)],
-                capture_output=True,
-                timeout=120,
-                check=False,
-            )
+            out_json = path.with_suffix(".rrrocket.json")
+            # Prefer file redirect — more reliable than capturing multi-MB stdout
+            with open(out_json, "wb") as fout:
+                proc = subprocess.run(
+                    [RRROCKET_BIN, "-n", str(path)],
+                    stdout=fout,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                    check=False,
+                )
             if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:500]
+                err = (proc.stderr or b"").decode("utf-8", "replace")[:600]
                 errors.append(f"rrrocket exit {proc.returncode}: {err}")
+            elif not out_json.exists() or out_json.stat().st_size < 10:
+                errors.append("rrrocket produced empty JSON")
             else:
-                data = json.loads(proc.stdout.decode("utf-8"))
+                with open(out_json, "r", encoding="utf-8") as fin:
+                    data = json.load(fin)
                 if isinstance(data, dict):
+                    log(f"  rrrocket OK ({out_json.stat().st_size} bytes JSON)")
                     return data
                 errors.append("rrrocket returned non-object JSON")
         except Exception as e:
             errors.append(f"rrrocket: {e}")
         finally:
+            if out_json is not None:
+                try:
+                    out_json.unlink(missing_ok=True)
+                except Exception:
+                    pass
             if tmp_created and path is not None:
                 try:
-                    Path(path).unlink(missing_ok=True)
+                    path.unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -116,6 +130,7 @@ def parse_replay_dict(raw: bytes, replay_path: Path | None = None) -> dict:
         try:
             parsed = boxcars_parse(raw)
             if isinstance(parsed, dict):
+                log("  boxcars_py OK (fallback)")
                 return parsed
             errors.append(f"boxcars returned non-dict: {type(parsed)}")
         except Exception as e:
@@ -369,12 +384,12 @@ def extract_heatmap_from_boxcars(
         return heatmaps, 0
 
     try:
-        parsed = boxcars_parse(raw)
+        parsed = parse_replay_dict(raw, replay_path=replay_path)
     except Exception as e:
-        log(f"  boxcars parse failed: {e}")
+        log(f"  parse failed: {e}")
         return heatmaps, 0
 
-    log(f"  parse type={type(parsed).__name__}")
+    log(f"  parse type={type(parsed).__name__} keys={list(parsed.keys())[:12] if isinstance(parsed, dict) else 'n/a'}")
     if not isinstance(parsed, dict):
         log(f"  unexpected parse type, attrs={dir(parsed)[:20]}")
         return heatmaps, 0
