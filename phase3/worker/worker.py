@@ -15,7 +15,10 @@ Env (GitHub Secrets / local .env):
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -25,14 +28,39 @@ from typing import Any
 
 import requests
 
-# ── boxcars / sprocket-boxcars-py ──────────────────────────────────────────
-# PyPI package: sprocket-boxcars-py
-# Actual import name in 0.3.x wheels: sprocket_boxcars_py  (docs still say boxcars_py)
-# Older SaltieRL package used module name boxcars_py.
+# ── Parser backends ────────────────────────────────────────────────────────
+# 1) rrrocket CLI (preferred) — tracks upstream boxcars, supports new RL attrs
+#    e.g. TAGame.Car_TA:DodgesRefreshedCounter (v0.10.11+)
+# 2) sprocket-boxcars-py fallback (often outdated vs live RL patches)
 boxcars_parse = None
 HAS_BOXCARS = False
+HAS_RRROCKET = False
+RRROCKET_BIN: str | None = None
 _BOXCARS_ERR = None
 _IMPORT_ERRORS: list[str] = []
+
+def _find_rrrocket() -> str | None:
+    env = os.environ.get("RRROCKET_BIN", "").strip()
+    if env and Path(env).is_file() and os.access(env, os.X_OK):
+        return env
+    which = shutil.which("rrrocket")
+    if which:
+        return which
+    for cand in (
+        Path("/usr/local/bin/rrrocket"),
+        Path.cwd() / "rrrocket",
+        Path(__file__).resolve().parent / "rrrocket",
+        Path("/opt/rrrocket/rrrocket"),
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+RRROCKET_BIN = _find_rrrocket()
+if RRROCKET_BIN:
+    HAS_RRROCKET = True
+    HAS_BOXCARS = True  # treat as available parser for heatmap path
+
 for _mod_name in ("sprocket_boxcars_py", "boxcars_py", "boxcars"):
     try:
         _m = __import__(_mod_name)
@@ -47,6 +75,55 @@ for _mod_name in ("sprocket_boxcars_py", "boxcars_py", "boxcars"):
         _IMPORT_ERRORS.append(f"{_mod_name}: {_e}")
 if not HAS_BOXCARS:
     _BOXCARS_ERR = " | ".join(_IMPORT_ERRORS) if _IMPORT_ERRORS else "no candidate module"
+
+
+def parse_replay_dict(raw: bytes, replay_path: Path | None = None) -> dict:
+    """Parse .replay → dict. Prefer rrrocket (up-to-date), else in-process boxcars."""
+    errors: list[str] = []
+
+    if HAS_RRROCKET and RRROCKET_BIN:
+        path = replay_path
+        tmp_created = False
+        try:
+            if path is None or not Path(path).exists():
+                path = TMP / f"_parse_{os.getpid()}_{int(time.time() * 1000)}.replay"
+                path.write_bytes(raw)
+                tmp_created = True
+            proc = subprocess.run(
+                [RRROCKET_BIN, "-n", str(path)],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:500]
+                errors.append(f"rrrocket exit {proc.returncode}: {err}")
+            else:
+                data = json.loads(proc.stdout.decode("utf-8"))
+                if isinstance(data, dict):
+                    return data
+                errors.append("rrrocket returned non-object JSON")
+        except Exception as e:
+            errors.append(f"rrrocket: {e}")
+        finally:
+            if tmp_created and path is not None:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    if callable(boxcars_parse):
+        try:
+            parsed = boxcars_parse(raw)
+            if isinstance(parsed, dict):
+                return parsed
+            errors.append(f"boxcars returned non-dict: {type(parsed)}")
+        except Exception as e:
+            errors.append(f"boxcars: {e}")
+
+    raise RuntimeError(
+        "No usable replay parser — " + (" | ".join(errors) if errors else "none installed")
+    )
 
 try:
     import numpy as np
@@ -269,7 +346,7 @@ def _active_actor_id(attr: Any) -> int | None:
 
 
 def extract_heatmap_from_boxcars(
-    raw: bytes, player_names: list[str]
+    raw: bytes, player_names: list[str], replay_path: Path | None = None
 ) -> tuple[dict[str, dict], int]:
     """
     Boxcars network body structure (serde JSON):
@@ -288,7 +365,7 @@ def extract_heatmap_from_boxcars(
     """
     heatmaps = {n: build_heatmap_empty() for n in player_names}
     frame_count = 0
-    if not HAS_BOXCARS or not HAS_NUMPY:
+    if (not HAS_BOXCARS and not HAS_RRROCKET) or not HAS_NUMPY:
         return heatmaps, 0
 
     try:
@@ -617,7 +694,7 @@ def process_one(replay_id: str) -> dict:
 
     path = download_replay(replay_id)
     raw = path.read_bytes()
-    heatmaps, frame_count = extract_heatmap_from_boxcars(raw, names)
+    heatmaps, frame_count = extract_heatmap_from_boxcars(raw, names, replay_path=path)
     frames_ok = frame_count > 0
 
     advanced = build_advanced(replay_id, details, heatmaps, frame_count, frames_ok)
@@ -640,7 +717,7 @@ def main() -> int:
         return 1
 
     log(
-        f"boxcars available: {HAS_BOXCARS}, numpy: {HAS_NUMPY}"
+        f"parser: rrrocket={HAS_RRROCKET} ({RRROCKET_BIN}), boxcars_py={bool(boxcars_parse)}, numpy={HAS_NUMPY}"
         + (f" (err: {_BOXCARS_ERR})" if not HAS_BOXCARS and _BOXCARS_ERR else "")
     )
     log(f"Host: {HOST}, batch: {BATCH_SIZE}, reprocess_empty: {REPROCESS_EMPTY}")
