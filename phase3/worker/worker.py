@@ -176,10 +176,116 @@ def build_heatmap_empty() -> dict:
     return {"cols": GRID, "rows": GRID, "cells": [0] * n, "max": 0}
 
 
+def _as_dict(obj: Any) -> Any:
+    """Normalize boxcars objects that may arrive as dicts (serde JSON) or plain values."""
+    return obj
+
+
+def _obj_id(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, dict):
+        for k in ("value", "ObjectId", "object_id", "id"):
+            if k in val and isinstance(val[k], int):
+                return val[k]
+    return None
+
+
+def _actor_id(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, dict):
+        for k in ("value", "ActorId", "actor_id", "id"):
+            if k in val and isinstance(val[k], int):
+                return val[k]
+    return None
+
+
+def _xy_from_location(loc: Any) -> tuple[float, float] | None:
+    if loc is None:
+        return None
+    if isinstance(loc, dict):
+        x = loc.get("x", loc.get("X"))
+        y = loc.get("y", loc.get("Y"))
+        if x is not None and y is not None:
+            return float(x), float(y)
+    if isinstance(loc, (list, tuple)) and len(loc) >= 2:
+        return float(loc[0]), float(loc[1])
+    return None
+
+
+def _xy_from_attribute(attr: Any) -> tuple[float, float] | None:
+    """Extract x,y from a boxcars Attribute (RigidBody / Location / nested)."""
+    if attr is None:
+        return None
+    if not isinstance(attr, dict):
+        return None
+    # serde enum: {"RigidBody": {...}} or {"Location": {...}}
+    if "RigidBody" in attr:
+        rb = attr["RigidBody"]
+        if isinstance(rb, dict):
+            return _xy_from_location(rb.get("location") or rb.get("Location"))
+    if "Location" in attr:
+        return _xy_from_location(attr["Location"])
+    # already unwrapped rigid body
+    if "location" in attr or "Location" in attr:
+        return _xy_from_location(attr.get("location") or attr.get("Location"))
+    if "x" in attr or "X" in attr:
+        return _xy_from_location(attr)
+    return None
+
+
+def _string_from_attribute(attr: Any) -> str | None:
+    if attr is None:
+        return None
+    if isinstance(attr, str):
+        return attr
+    if isinstance(attr, dict):
+        if "String" in attr:
+            s = attr["String"]
+            return str(s) if s is not None else None
+        if "string" in attr:
+            s = attr["string"]
+            return str(s) if s is not None else None
+    return None
+
+
+def _active_actor_id(attr: Any) -> int | None:
+    """Engine.Pawn:PlayerReplicationInfo style ActiveActor → target actor id."""
+    if not isinstance(attr, dict):
+        return None
+    node = attr.get("ActiveActor") if "ActiveActor" in attr else attr
+    if not isinstance(node, dict):
+        return None
+    # common shapes: {active: true, actor: 12} or {actor: {value: 12}}
+    for k in ("actor", "Actor", "actor_id", "ActorId"):
+        if k in node:
+            return _actor_id(node[k])
+    return None
+
+
 def extract_heatmap_from_boxcars(
     raw: bytes, player_names: list[str]
 ) -> tuple[dict[str, dict], int]:
-    """Best-effort position sampling → per-player heatmap. Returns (heatmaps, frame_count)."""
+    """
+    Boxcars network body structure (serde JSON):
+      network_frames.frames[] → {
+        new_actors: [{actor_id, object_id, name_id, initial_trajectory}],
+        updated_actors: [{actor_id, object_id, stream_id, attribute: {RigidBody|String|ActiveActor|...}}],
+        deleted_actors: [actor_id]
+      }
+      objects[] → class/archetype names (index = object_id)
+      names[]   → optional name table
+
+    Cars don't carry player names. Linkage:
+      PRI actor  ← PlayerName String attribute
+      Car actor  ← PlayerReplicationInfo ActiveActor → PRI actor
+      Car actor  ← RigidBody.location for heatmap samples
+    """
     heatmaps = {n: build_heatmap_empty() for n in player_names}
     frame_count = 0
     if not HAS_BOXCARS or not HAS_NUMPY:
@@ -192,77 +298,181 @@ def extract_heatmap_from_boxcars(
         return heatmaps, 0
 
     log(f"  parse type={type(parsed).__name__}")
-
-    frames = None
-    if isinstance(parsed, dict):
-        frames = parsed.get("network_frames") or parsed.get("frames")
-        if isinstance(frames, dict):
-            frames = frames.get("frames") or frames.get("network_frames")
-    if frames is None:
-        frames = getattr(parsed, "network_frames", None) or getattr(parsed, "frames", None)
-
-    if not frames:
-        keys = list(parsed.keys())[:30] if isinstance(parsed, dict) else dir(parsed)[:30]
-        log(f"  no network frames — keys/attrs sample: {keys}")
+    if not isinstance(parsed, dict):
+        log(f"  unexpected parse type, attrs={dir(parsed)[:20]}")
         return heatmaps, 0
 
-    grids = {n: np.zeros((GRID, GRID), dtype=np.int32) for n in player_names}
+    objects = parsed.get("objects") or []
+    if not isinstance(objects, list):
+        objects = []
+
+    nf = parsed.get("network_frames")
+    frames = None
+    if isinstance(nf, dict):
+        frames = nf.get("frames")
+    elif isinstance(nf, list):
+        frames = nf
+    if frames is None:
+        frames = parsed.get("frames")
+    if not frames:
+        log(f"  no network frames — top keys: {list(parsed.keys())[:30]}")
+        return heatmaps, 0
+
     name_lower = {n.lower(): n for n in player_names}
+    grids = {n: np.zeros((GRID, GRID), dtype=np.int32) for n in player_names}
+
+    # actor_id → kind
+    actor_is_car: dict[int, bool] = {}
+    actor_is_pri: dict[int, bool] = {}
+    # PRI actor_id → player display name (matched to ballchasing names)
+    pri_name: dict[int, str] = {}
+    # car actor_id → PRI actor_id
+    car_to_pri: dict[int, int] = {}
+    # last known car position
+    car_pos: dict[int, tuple[float, float]] = {}
+
+    hits = 0
+    rb_seen = 0
+    names_seen = 0
+    links_seen = 0
 
     def accumulate(name: str, x: float, y: float) -> None:
-        nx = (float(x) + 4000) / 8000
-        ny = (float(y) + 5000) / 10000
+        nonlocal hits
+        nx = (float(x) + 4096.0) / 8192.0
+        ny = (float(y) + 5120.0) / 10240.0
         nx = max(0.0, min(0.999, nx))
         ny = max(0.0, min(0.999, ny))
         c = int(nx * GRID)
         r = int(ny * GRID)
         grids[name][r, c] += 1
+        hits += 1
+
+    def object_name(oid: int | None) -> str:
+        if oid is None or oid < 0 or oid >= len(objects):
+            return ""
+        o = objects[oid]
+        return str(o) if o is not None else ""
+
+    def classify_object(oname: str) -> str:
+        low = oname.lower()
+        if "car" in low and "archetypes" in low:
+            return "car"
+        if "playerreplicationinfo" in low or low.endswith("pri_ta") or ".pri_" in low:
+            return "pri"
+        if "car" in low and ("tagame" in low or "vehicle" in low):
+            return "car"
+        return ""
+
+    def match_player(raw_name: str) -> str | None:
+        if not raw_name:
+            return None
+        key = raw_name.lower().strip()
+        if key in name_lower:
+            return name_lower[key]
+        # soft match: strip tags / platform suffixes
+        for cand, orig in name_lower.items():
+            if cand in key or key in cand:
+                return orig
+        return None
 
     try:
         for fr in frames:
             frame_count += 1
+            if not isinstance(fr, dict):
+                continue
+
+            for na in fr.get("new_actors") or []:
+                if not isinstance(na, dict):
+                    continue
+                aid = _actor_id(na.get("actor_id"))
+                oid = _obj_id(na.get("object_id") if "object_id" in na else na.get("object_ind"))
+                if aid is None:
+                    continue
+                kind = classify_object(object_name(oid))
+                if kind == "car":
+                    actor_is_car[aid] = True
+                    traj = na.get("initial_trajectory") or {}
+                    if isinstance(traj, dict):
+                        xy = _xy_from_location(traj.get("location"))
+                        if xy:
+                            car_pos[aid] = xy
+                elif kind == "pri":
+                    actor_is_pri[aid] = True
+
+            for ua in fr.get("updated_actors") or []:
+                if not isinstance(ua, dict):
+                    continue
+                aid = _actor_id(ua.get("actor_id"))
+                if aid is None:
+                    continue
+                oid = _obj_id(ua.get("object_id"))
+                oname = object_name(oid)
+                attr = ua.get("attribute")
+
+                # Player name on PRI
+                s = _string_from_attribute(attr)
+                if s and (
+                    actor_is_pri.get(aid)
+                    or "playername" in oname.lower()
+                    or "playerreplicationinfo" in oname.lower()
+                ):
+                    matched = match_player(s)
+                    if matched:
+                        pri_name[aid] = matched
+                        actor_is_pri[aid] = True
+                        names_seen += 1
+
+                # Car → PRI link (ActiveActor)
+                link = _active_actor_id(attr)
+                if link is not None and (
+                    actor_is_car.get(aid)
+                    or "playerreplicationinfo" in oname.lower()
+                    or "pawn" in oname.lower()
+                ):
+                    car_to_pri[aid] = link
+                    actor_is_car[aid] = True
+                    links_seen += 1
+
+                # Rigid body position on car
+                xy = _xy_from_attribute(attr)
+                if xy is not None:
+                    rb_seen += 1
+                    if actor_is_car.get(aid) or "rbstate" in oname.lower() or "rbactor" in oname.lower():
+                        actor_is_car[aid] = True
+                        car_pos[aid] = xy
+
+            for da in fr.get("deleted_actors") or []:
+                did = _actor_id(da) if not isinstance(da, int) else da
+                if did is not None:
+                    actor_is_car.pop(did, None)
+                    actor_is_pri.pop(did, None)
+                    car_to_pri.pop(did, None)
+                    car_pos.pop(did, None)
+                    pri_name.pop(did, None)
+
+            # sample every 4th frame into heatmaps
             if frame_count % 4 != 0:
                 continue
-            actors = None
-            if isinstance(fr, dict):
-                actors = (
-                    fr.get("actors")
-                    or fr.get("new_actors")
-                    or fr.get("updated_actors")
-                )
-            if not actors:
-                continue
-            if isinstance(actors, dict):
-                actors = actors.values()
-            for act in actors:
-                if not isinstance(act, dict):
-                    continue
-                aname = act.get("name") or act.get("player_name") or ""
-                key = str(aname).lower()
-                if key not in name_lower:
-                    continue
-                pos = act.get("position") or act.get("pos") or act.get("RigidBody")
-                if isinstance(pos, dict):
-                    x = pos.get("x") or pos.get("X")
-                    y = pos.get("y") or pos.get("Y")
-                elif isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                    x, y = pos[0], pos[1]
-                else:
-                    x = act.get("x")
-                    y = act.get("y")
-                if x is None or y is None:
-                    continue
-                accumulate(name_lower[key], x, y)
+            for caid, xy in car_pos.items():
+                pri = car_to_pri.get(caid)
+                pname = pri_name.get(pri) if pri is not None else None
+                if pname:
+                    accumulate(pname, xy[0], xy[1])
+
     except Exception as e:
         log(f"  frame walk error: {e}")
+        traceback.print_exc()
 
     for n, g in grids.items():
         flat = g.flatten().tolist()
         mx = int(g.max()) if g.size else 0
         heatmaps[n] = {"cols": GRID, "rows": GRID, "cells": flat, "max": mx}
 
-    if frame_count:
-        log(f"  frames sampled path: {frame_count}, heat max={[heatmaps[n]['max'] for n in player_names]}")
+    log(
+        f"  frames={frame_count} rb={rb_seen} names={names_seen} links={links_seen} "
+        f"hits={hits} cars={len(actor_is_car)} pris={len(pri_name)} "
+        f"heat_max={[heatmaps[n]['max'] for n in player_names]}"
+    )
     return heatmaps, frame_count
 
 
