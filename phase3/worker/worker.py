@@ -413,23 +413,24 @@ def extract_heatmap_from_boxcars(
     name_lower = {n.lower(): n for n in player_names}
     grids = {n: np.zeros((GRID, GRID), dtype=np.int32) for n in player_names}
 
-    # actor_id → kind
     actor_is_car: dict[int, bool] = {}
     actor_is_pri: dict[int, bool] = {}
-    # PRI actor_id → player display name (matched to ballchasing names)
     pri_name: dict[int, str] = {}
-    # car actor_id → PRI actor_id
     car_to_pri: dict[int, int] = {}
-    # last known car position
     car_pos: dict[int, tuple[float, float]] = {}
+    # reverse: PRI → car (latest)
+    pri_to_car: dict[int, int] = {}
 
     hits = 0
     rb_seen = 0
     names_seen = 0
     links_seen = 0
+    raw_names_found: set[str] = set()
 
     def accumulate(name: str, x: float, y: float) -> None:
         nonlocal hits
+        if name not in grids:
+            return
         nx = (float(x) + 4096.0) / 8192.0
         ny = (float(y) + 5120.0) / 10240.0
         nx = max(0.0, min(0.999, nx))
@@ -447,25 +448,51 @@ def extract_heatmap_from_boxcars(
 
     def classify_object(oname: str) -> str:
         low = oname.lower()
-        if "car" in low and "archetypes" in low:
+        # Prefer strict car archetype match
+        if "archetypes.car." in low or low.endswith("car_default") or "archetypes.car" in low:
             return "car"
-        if "playerreplicationinfo" in low or low.endswith("pri_ta") or ".pri_" in low:
+        if "playerreplicationinfo" in low or "default__pri" in low or low.endswith("pri_ta"):
             return "pri"
-        if "car" in low and ("tagame" in low or "vehicle" in low):
-            return "car"
         return ""
 
     def match_player(raw_name: str) -> str | None:
         if not raw_name:
             return None
         key = raw_name.lower().strip()
+        if not key:
+            return None
         if key in name_lower:
             return name_lower[key]
-        # soft match: strip tags / platform suffixes
+        # strip common suffixes / clan tags roughly
+        key2 = key.split("#")[0].strip()
+        if key2 in name_lower:
+            return name_lower[key2]
         for cand, orig in name_lower.items():
-            if cand in key or key in cand:
+            if len(cand) >= 3 and (cand in key or key in cand or cand in key2 or key2 in cand):
                 return orig
         return None
+
+    # Seed names from header PlayerStats when present
+    props = parsed.get("properties")
+    if isinstance(props, list):
+        # boxcars sometimes uses list of [key, value] pairs
+        prop_map = {}
+        for item in props:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                prop_map[str(item[0])] = item[1]
+            elif isinstance(item, dict) and "name" in item:
+                prop_map[str(item.get("name"))] = item.get("value")
+        props = prop_map
+    if isinstance(props, dict):
+        pstats = props.get("PlayerStats") or props.get("PlayerStats") 
+        if isinstance(pstats, list):
+            for ps in pstats:
+                if not isinstance(ps, dict):
+                    continue
+                nm = ps.get("Name") or ps.get("PlayerName") or ps.get("name")
+                if isinstance(nm, str):
+                    raw_names_found.add(nm)
+                    match_player(nm)  # warm soft-match paths
 
     try:
         for fr in frames:
@@ -499,37 +526,52 @@ def extract_heatmap_from_boxcars(
                     continue
                 oid = _obj_id(ua.get("object_id"))
                 oname = object_name(oid)
+                oname_l = oname.lower()
                 attr = ua.get("attribute")
 
-                # Player name on PRI
+                # Any String that looks like a player name
                 s = _string_from_attribute(attr)
-                if s and (
-                    actor_is_pri.get(aid)
-                    or "playername" in oname.lower()
-                    or "playerreplicationinfo" in oname.lower()
-                ):
+                if s and len(s) < 64:
+                    raw_names_found.add(s)
                     matched = match_player(s)
-                    if matched:
-                        pri_name[aid] = matched
-                        actor_is_pri[aid] = True
-                        names_seen += 1
+                    # Accept as PRI name if: already PRI, attribute is PlayerName, or matched a known player
+                    if matched and (
+                        actor_is_pri.get(aid)
+                        or "playername" in oname_l
+                        or "playerreplicationinfo" in oname_l
+                        or matched is not None
+                    ):
+                        # Prefer PlayerName attribute; still allow matched strings on PRI actors
+                        if actor_is_pri.get(aid) or "playername" in oname_l or "playerreplicationinfo" in oname_l or matched:
+                            if "playername" in oname_l or actor_is_pri.get(aid) or matched:
+                                if matched:
+                                    pri_name[aid] = matched
+                                    actor_is_pri[aid] = True
+                                    names_seen += 1
 
-                # Car → PRI link (ActiveActor)
+                # Car → PRI (Engine.Pawn:PlayerReplicationInfo ActiveActor)
                 link = _active_actor_id(attr)
-                if link is not None and (
-                    actor_is_car.get(aid)
-                    or "playerreplicationinfo" in oname.lower()
-                    or "pawn" in oname.lower()
-                ):
-                    car_to_pri[aid] = link
-                    actor_is_car[aid] = True
-                    links_seen += 1
+                if link is not None:
+                    if (
+                        actor_is_car.get(aid)
+                        or "playerreplicationinfo" in oname_l
+                        or oname_l.endswith("pawn:playerreplicationinfo")
+                        or "engine.pawn" in oname_l
+                    ):
+                        car_to_pri[aid] = link
+                        pri_to_car[link] = aid
+                        actor_is_car[aid] = True
+                        links_seen += 1
 
-                # Rigid body position on car
+                # RigidBody → car position
                 xy = _xy_from_attribute(attr)
                 if xy is not None:
                     rb_seen += 1
-                    if actor_is_car.get(aid) or "rbstate" in oname.lower() or "rbactor" in oname.lower():
+                    if (
+                        actor_is_car.get(aid)
+                        or "replicatedrbstate" in oname_l
+                        or "rbactor" in oname_l
+                    ):
                         actor_is_car[aid] = True
                         car_pos[aid] = xy
 
@@ -537,15 +579,19 @@ def extract_heatmap_from_boxcars(
                 did = _actor_id(da) if not isinstance(da, int) else da
                 if did is not None:
                     actor_is_car.pop(did, None)
-                    actor_is_pri.pop(did, None)
                     car_to_pri.pop(did, None)
                     car_pos.pop(did, None)
+                    # keep pri_name — PRI may respawn with same id rarely; safe to drop
+                    actor_is_pri.pop(did, None)
                     pri_name.pop(did, None)
+                    for k, v in list(pri_to_car.items()):
+                        if v == did:
+                            pri_to_car.pop(k, None)
 
-            # sample every 4th frame into heatmaps
-            if frame_count % 4 != 0:
+            # sample every 2nd frame (denser heatmaps)
+            if frame_count % 2 != 0:
                 continue
-            for caid, xy in car_pos.items():
+            for caid, xy in list(car_pos.items()):
                 pri = car_to_pri.get(caid)
                 pname = pri_name.get(pri) if pri is not None else None
                 if pname:
@@ -554,6 +600,16 @@ def extract_heatmap_from_boxcars(
     except Exception as e:
         log(f"  frame walk error: {e}")
         traceback.print_exc()
+
+    # Fallback: if no hits but we have car positions + player names, dump debug
+    if hits == 0:
+        sample_pri = list(pri_name.items())[:6]
+        sample_links = list(car_to_pri.items())[:6]
+        log(
+            f"  debug names_raw={list(raw_names_found)[:12]} "
+            f"pri_map={sample_pri} links={sample_links} "
+            f"want={player_names}"
+        )
 
     for n, g in grids.items():
         flat = g.flatten().tolist()
