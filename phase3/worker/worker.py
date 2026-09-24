@@ -26,28 +26,27 @@ from typing import Any
 import requests
 
 # ── boxcars / sprocket-boxcars-py ──────────────────────────────────────────
-# Package name on PyPI: sprocket-boxcars-py
-# Import module name:   boxcars_py  (parse_replay)
+# PyPI package: sprocket-boxcars-py
+# Actual import name in 0.3.x wheels: sprocket_boxcars_py  (docs still say boxcars_py)
+# Older SaltieRL package used module name boxcars_py.
 boxcars_parse = None
 HAS_BOXCARS = False
 _BOXCARS_ERR = None
-try:
-    from boxcars_py import parse_replay as boxcars_parse  # type: ignore
-    HAS_BOXCARS = True
-except Exception as e1:
-    _BOXCARS_ERR = str(e1)
+_IMPORT_ERRORS: list[str] = []
+for _mod_name in ("sprocket_boxcars_py", "boxcars_py", "boxcars"):
     try:
-        import boxcars_py as _bp  # type: ignore
-
-        boxcars_parse = getattr(_bp, "parse_replay", None) or getattr(_bp, "parse", None)
-        HAS_BOXCARS = callable(boxcars_parse)
-        if not HAS_BOXCARS:
-            _BOXCARS_ERR = (
-                f"{e1} | boxcars_py loaded but no parse_replay; "
-                f"attrs={[x for x in dir(_bp) if not x.startswith('_')][:20]}"
-            )
-    except Exception as e2:
-        _BOXCARS_ERR = f"{e1} | {e2}"
+        _m = __import__(_mod_name)
+        _fn = getattr(_m, "parse_replay", None) or getattr(_m, "parse", None)
+        if callable(_fn):
+            boxcars_parse = _fn
+            HAS_BOXCARS = True
+            break
+        _pub = [x for x in dir(_m) if not x.startswith("_")]
+        _IMPORT_ERRORS.append(f"{_mod_name} loaded but no parse_replay; attrs={_pub[:20]}")
+    except Exception as _e:
+        _IMPORT_ERRORS.append(f"{_mod_name}: {_e}")
+if not HAS_BOXCARS:
+    _BOXCARS_ERR = " | ".join(_IMPORT_ERRORS) if _IMPORT_ERRORS else "no candidate module"
 
 try:
     import numpy as np
