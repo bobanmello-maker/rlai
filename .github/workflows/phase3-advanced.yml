@@ -34,27 +34,31 @@ jobs:
           cache: "pip"
           cache-dependency-path: phase3/worker/requirements.txt
 
-      - name: Install dependencies
+      - name: Install rrrocket (up-to-date boxcars CLI)
+        run: |
+          set -e
+          VER=0.11.5
+          URL="https://github.com/nickbabcock/rrrocket/releases/download/v${VER}/rrrocket-${VER}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$URL" -o /tmp/rrrocket.tgz
+          tar -xzf /tmp/rrrocket.tgz -C /tmp
+          BIN=$(find /tmp -type f -name rrrocket | head -1)
+          sudo install -m 755 "$BIN" /usr/local/bin/rrrocket
+          rrrocket --help | head -3
+          echo "rrrocket installed: $(which rrrocket)"
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "requests>=2.31.0" "numpy>=1.24.0"
-          # Package name != import name: sprocket-boxcars-py → module sprocket_boxcars_py
-          pip install "sprocket-boxcars-py>=0.3.0" || pip install "boxcars-py==0.1.0" || echo "WARN: no boxcars package — heatmaps disabled"
+          # optional fallback (often lagging behind RL patches)
+          pip install "sprocket-boxcars-py>=0.3.0" || echo "WARN: sprocket-boxcars-py missing (rrrocket is primary)"
           python - <<'PY'
-          import importlib, pkgutil
-          found = [m.name for m in pkgutil.iter_modules() if "box" in m.name.lower() or "sprocket" in m.name.lower()]
-          print("candidate modules:", found)
-          ok = False
-          for name in ("sprocket_boxcars_py", "boxcars_py", "boxcars"):
-              try:
-                  m = importlib.import_module(name)
-                  fn = getattr(m, "parse_replay", None) or getattr(m, "parse", None)
-                  print(f"{name}: OK parse_replay={callable(fn)} file={getattr(m,'__file__',None)}")
-                  ok = ok or callable(fn)
-              except Exception as e:
-                  print(f"{name}: FAIL {e}")
-          if not ok:
-              raise SystemExit("ERROR: no usable boxcars parser — heatmaps will be empty")
+          import shutil, subprocess
+          bin = shutil.which("rrrocket")
+          print("rrrocket:", bin)
+          if not bin:
+              raise SystemExit("ERROR: rrrocket not on PATH")
+          print("rrrocket OK")
           PY
 
       - name: Run worker
