@@ -16,6 +16,7 @@ Env (GitHub Secrets / local .env):
 from __future__ import annotations
 
 import json
+import unicodedata
 import os
 import shutil
 import subprocess
@@ -360,6 +361,15 @@ def _active_actor_id(attr: Any) -> int | None:
     return None
 
 
+
+def _fold_name(s: str) -> str:
+    """Lowercase + strip diacritics so 'Činčila' matches 'Cincila' / mangled 'inila'."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower().strip()
+
 def extract_heatmap_from_boxcars(
     raw: bytes, player_names: list[str], replay_path: Path | None = None
 ) -> tuple[dict[str, dict], int]:
@@ -458,18 +468,32 @@ def extract_heatmap_from_boxcars(
     def match_player(raw_name: str) -> str | None:
         if not raw_name:
             return None
-        key = raw_name.lower().strip()
+        key = _fold_name(raw_name)
         if not key:
             return None
-        if key in name_lower:
-            return name_lower[key]
-        # strip common suffixes / clan tags roughly
-        key2 = key.split("#")[0].strip()
-        if key2 in name_lower:
-            return name_lower[key2]
+        # exact folded match
         for cand, orig in name_lower.items():
-            if len(cand) >= 3 and (cand in key or key in cand or cand in key2 or key2 in cand):
+            if _fold_name(cand) == key:
                 return orig
+        key2 = key.split("#")[0].strip()
+        for cand, orig in name_lower.items():
+            fc = _fold_name(cand)
+            if fc == key2:
+                return orig
+        # substring folded (handles missing first letters from bad sanitizers)
+        for cand, orig in name_lower.items():
+            fc = _fold_name(cand)
+            if len(fc) >= 3 and len(key) >= 3 and (fc in key or key in fc or fc in key2 or key2 in fc):
+                return orig
+        # last resort: compare alnum-only
+        def alnum(x: str) -> str:
+            return "".join(ch for ch in _fold_name(x) if ch.isalnum())
+        ka = alnum(raw_name)
+        if len(ka) >= 3:
+            for cand, orig in name_lower.items():
+                ca = alnum(cand)
+                if ca == ka or (len(ca) >= 3 and (ca in ka or ka in ca)):
+                    return orig
         return None
 
     # Seed names from header PlayerStats when present
@@ -549,19 +573,13 @@ def extract_heatmap_from_boxcars(
                                     actor_is_pri[aid] = True
                                     names_seen += 1
 
-                # Car → PRI (Engine.Pawn:PlayerReplicationInfo ActiveActor)
+                # Car → PRI ONLY via Engine.Pawn:PlayerReplicationInfo (not other ActiveActors)
                 link = _active_actor_id(attr)
-                if link is not None:
-                    if (
-                        actor_is_car.get(aid)
-                        or "playerreplicationinfo" in oname_l
-                        or oname_l.endswith("pawn:playerreplicationinfo")
-                        or "engine.pawn" in oname_l
-                    ):
-                        car_to_pri[aid] = link
-                        pri_to_car[link] = aid
-                        actor_is_car[aid] = True
-                        links_seen += 1
+                if link is not None and "playerreplicationinfo" in oname_l:
+                    car_to_pri[aid] = link
+                    pri_to_car[link] = aid
+                    actor_is_car[aid] = True
+                    links_seen += 1
 
                 # RigidBody → car position
                 xy = _xy_from_attribute(attr)
@@ -581,9 +599,8 @@ def extract_heatmap_from_boxcars(
                     actor_is_car.pop(did, None)
                     car_to_pri.pop(did, None)
                     car_pos.pop(did, None)
-                    # keep pri_name — PRI may respawn with same id rarely; safe to drop
                     actor_is_pri.pop(did, None)
-                    pri_name.pop(did, None)
+                    # keep pri_name[did] — recycled IDs still help late links
                     for k, v in list(pri_to_car.items()):
                         if v == did:
                             pri_to_car.pop(k, None)
@@ -594,6 +611,9 @@ def extract_heatmap_from_boxcars(
             for caid, xy in list(car_pos.items()):
                 pri = car_to_pri.get(caid)
                 pname = pri_name.get(pri) if pri is not None else None
+                if not pname:
+                    # reverse: this actor might itself be a known PRI with a car pos (rare)
+                    pname = pri_name.get(caid)
                 if pname:
                     accumulate(pname, xy[0], xy[1])
 
