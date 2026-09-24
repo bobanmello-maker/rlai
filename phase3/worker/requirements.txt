@@ -1,3 +1,4 @@
 requests>=2.31.0
-boxcars-py>=0.1.14
 numpy>=1.24.0
+# boxcars-py na PyPI trenutno samo 0.1.0 — heatmap best-effort
+boxcars-py==0.1.0
