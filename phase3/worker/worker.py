@@ -16,6 +16,8 @@ Env (GitHub Secrets / local .env):
 from __future__ import annotations
 
 import json
+import difflib
+import re
 import unicodedata
 import os
 import shutil
@@ -468,32 +470,59 @@ def extract_heatmap_from_boxcars(
     def match_player(raw_name: str) -> str | None:
         if not raw_name:
             return None
+        # ignore non-player strings
+        if raw_name.strip().lower() in {"offline match", "online match", "none", ""}:
+            return None
+
+        def alnum(x: str) -> str:
+            return "".join(ch for ch in _fold_name(x) if ch.isalnum())
+
+        def split_suffix(x: str) -> tuple[str, str]:
+            # "Name(2)" → ("Name", "(2)")
+            m = re.match(r"^(.*?)(\(\d+\))\s*$", x.strip())
+            if m:
+                return m.group(1), m.group(2)
+            return x.strip(), ""
+
         key = _fold_name(raw_name)
         if not key:
             return None
-        # exact folded match
+        raw_base, raw_suf = split_suffix(raw_name)
+        key_base = alnum(raw_base)
+        key_all = alnum(raw_name)
+
+        # 1) exact folded
         for cand, orig in name_lower.items():
             if _fold_name(cand) == key:
                 return orig
-        key2 = key.split("#")[0].strip()
+
+        # 2) same numeric suffix + fuzzy base (handles Činčila vs inila)
+        best: tuple[float, str] | None = None
         for cand, orig in name_lower.items():
-            fc = _fold_name(cand)
-            if fc == key2:
+            c_base, c_suf = split_suffix(cand)
+            # prefer same (1)/(2)/(3) suffix when both have it
+            if raw_suf and c_suf and raw_suf != c_suf:
+                continue
+            ca = alnum(c_base) if raw_suf else alnum(cand)
+            ka = key_base if raw_suf else key_all
+            if not ca or not ka:
+                continue
+            if ca == ka:
                 return orig
-        # substring folded (handles missing first letters from bad sanitizers)
+            ratio = difflib.SequenceMatcher(None, ca, ka).ratio()
+            # also try full alnum
+            ratio2 = difflib.SequenceMatcher(None, alnum(cand), key_all).ratio()
+            ratio = max(ratio, ratio2)
+            if ratio >= 0.78 and (best is None or ratio > best[0]):
+                best = (ratio, orig)
+        if best:
+            return best[1]
+
+        # 3) substring fallback
         for cand, orig in name_lower.items():
-            fc = _fold_name(cand)
-            if len(fc) >= 3 and len(key) >= 3 and (fc in key or key in fc or fc in key2 or key2 in fc):
+            fc = alnum(cand)
+            if len(fc) >= 4 and len(key_all) >= 4 and (fc in key_all or key_all in fc):
                 return orig
-        # last resort: compare alnum-only
-        def alnum(x: str) -> str:
-            return "".join(ch for ch in _fold_name(x) if ch.isalnum())
-        ka = alnum(raw_name)
-        if len(ka) >= 3:
-            for cand, orig in name_lower.items():
-                ca = alnum(cand)
-                if ca == ka or (len(ca) >= 3 and (ca in ka or ka in ca)):
-                    return orig
         return None
 
     # Seed names from header PlayerStats when present
