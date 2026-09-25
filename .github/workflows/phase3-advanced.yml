@@ -12,7 +12,7 @@ on:
       batch_size:
         description: "Koliko replay-a u ovom runu (max 200, preporuka 180)"
         required: false
-        default: "180"
+        default: "100"
       reprocess_empty:
         description: "Ponovo obradi mečeve bez heatmap/frame podataka (1=da)"
         required: false
@@ -66,7 +66,7 @@ jobs:
           BALLCHASING_TOKEN: ${{ secrets.BALLCHASING_TOKEN }}
           HOST_BASE_URL: ${{ secrets.HOST_BASE_URL }}
           UPLOAD_TOKEN: ${{ secrets.UPLOAD_TOKEN }}
-          BATCH_SIZE: ${{ github.event.inputs.batch_size || '180' }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '100' }}
           REPROCESS_EMPTY: ${{ github.event.inputs.reprocess_empty || '1' }}
         run: |
           python phase3/worker/worker.py
