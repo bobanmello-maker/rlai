@@ -315,68 +315,23 @@ def _xy_from_location(loc: Any) -> tuple[float, float] | None:
 
 def _xy_from_attribute(attr: Any) -> tuple[float, float] | None:
     """Extract x,y from a boxcars Attribute (RigidBody / Location / nested)."""
-    rb = _rigid_body_from_attribute(attr)
-    if rb and rb.get("location"):
-        return _xy_from_location(rb["location"])
-    if attr is None or not isinstance(attr, dict):
+    if attr is None:
         return None
+    if not isinstance(attr, dict):
+        return None
+    # serde enum: {"RigidBody": {...}} or {"Location": {...}}
+    if "RigidBody" in attr:
+        rb = attr["RigidBody"]
+        if isinstance(rb, dict):
+            return _xy_from_location(rb.get("location") or rb.get("Location"))
     if "Location" in attr:
         return _xy_from_location(attr["Location"])
+    # already unwrapped rigid body
     if "location" in attr or "Location" in attr:
         return _xy_from_location(attr.get("location") or attr.get("Location"))
     if "x" in attr or "X" in attr:
         return _xy_from_location(attr)
     return None
-
-
-def _vec3(obj: Any) -> tuple[float, float, float] | None:
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        x = obj.get("x", obj.get("X"))
-        y = obj.get("y", obj.get("Y"))
-        z = obj.get("z", obj.get("Z"))
-        if x is not None and y is not None:
-            return float(x), float(y), float(z or 0.0)
-    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
-        return float(obj[0]), float(obj[1]), float(obj[2] if len(obj) > 2 else 0.0)
-    return None
-
-
-def _rigid_body_from_attribute(attr: Any) -> dict | None:
-    """Return {location:(x,y,z), velocity:(x,y,z)} from RigidBody attribute if present."""
-    if attr is None or not isinstance(attr, dict):
-        return None
-    rb = attr.get("RigidBody") if "RigidBody" in attr else None
-    if rb is None and ("location" in attr or "Location" in attr):
-        rb = attr
-    if not isinstance(rb, dict):
-        return None
-    loc = _vec3(rb.get("location") or rb.get("Location"))
-    vel = _vec3(
-        rb.get("linear_velocity")
-        or rb.get("LinearVelocity")
-        or rb.get("linearVelocity")
-        or rb.get("velocity")
-        or rb.get("Velocity")
-    )
-    if loc is None:
-        return None
-    return {"location": loc, "velocity": vel or (0.0, 0.0, 0.0)}
-
-
-def _speed_uu(vel: tuple[float, float, float] | None) -> float:
-    if not vel:
-        return 0.0
-    return (vel[0] ** 2 + vel[1] ** 2 + vel[2] ** 2) ** 0.5
-
-
-# Unreal units/s → km/h (community approx used by RL tools)
-UU_TO_KMH = 0.036
-
-
-def _speed_kmh(speed_uu: float) -> float:
-    return round(float(speed_uu) * UU_TO_KMH, 1)
 
 
 def _string_from_attribute(attr: Any) -> str | None:
@@ -419,7 +374,7 @@ def _fold_name(s: str) -> str:
 
 def extract_heatmap_from_boxcars(
     raw: bytes, player_names: list[str], replay_path: Path | None = None
-) -> tuple[dict[str, dict], int, dict]:
+) -> tuple[dict[str, dict], int]:
     """
     Boxcars network body structure (serde JSON):
       network_frames.frames[] → {
@@ -437,24 +392,19 @@ def extract_heatmap_from_boxcars(
     """
     heatmaps = {n: build_heatmap_empty() for n in player_names}
     frame_count = 0
-    intel: dict[str, Any] = {
-        "ball_speed_by_frame": {},  # frame_idx -> speed_uu (sparse)
-        "ball_z_by_frame": {},
-        "car_dist_to_ball": [],  # optional samples
-    }
     if (not HAS_BOXCARS and not HAS_RRROCKET) or not HAS_NUMPY:
-        return heatmaps, 0, intel
+        return heatmaps, 0
 
     try:
         parsed = parse_replay_dict(raw, replay_path=replay_path)
     except Exception as e:
         log(f"  parse failed: {e}")
-        return heatmaps, 0, intel
+        return heatmaps, 0
 
     log(f"  parse type={type(parsed).__name__} keys={list(parsed.keys())[:12] if isinstance(parsed, dict) else 'n/a'}")
     if not isinstance(parsed, dict):
         log(f"  unexpected parse type, attrs={dir(parsed)[:20]}")
-        return heatmaps, 0, intel
+        return heatmaps, 0
 
     objects = parsed.get("objects") or []
     if not isinstance(objects, list):
@@ -470,7 +420,7 @@ def extract_heatmap_from_boxcars(
         frames = parsed.get("frames")
     if not frames:
         log(f"  no network frames — top keys: {list(parsed.keys())[:30]}")
-        return heatmaps, 0, intel
+        return heatmaps, 0
 
     name_lower = {n.lower(): n for n in player_names}
     grids = {n: np.zeros((GRID, GRID), dtype=np.int32) for n in player_names}
@@ -480,24 +430,13 @@ def extract_heatmap_from_boxcars(
     pri_name: dict[int, str] = {}
     car_to_pri: dict[int, int] = {}
     car_pos: dict[int, tuple[float, float]] = {}
-    car_pos3: dict[int, tuple[float, float, float]] = {}
     # reverse: PRI → car (latest)
     pri_to_car: dict[int, int] = {}
-    actor_is_ball: dict[int, bool] = {}
-    ball_pos: tuple[float, float, float] | None = None
-    ball_vel: tuple[float, float, float] | None = None
-    ball_speed_by_frame: dict[int, float] = {}
-    ball_z_by_frame: dict[int, float] = {}
-    # kickoff: track early ball motion
-    kickoff_ball_moved_frame: int | None = None
-    kickoff_first_car: str | None = None
-    kickoff_first_dist: float | None = None
 
     hits = 0
     rb_seen = 0
     names_seen = 0
     links_seen = 0
-    ball_rb_seen = 0
     raw_names_found: set[str] = set()
 
     def accumulate(name: str, x: float, y: float) -> None:
@@ -526,8 +465,6 @@ def extract_heatmap_from_boxcars(
             return "car"
         if "playerreplicationinfo" in low or "default__pri" in low or low.endswith("pri_ta"):
             return "pri"
-        if "archetypes.ball" in low or "ball_ta" in low or low.endswith(".ball"):
-            return "ball"
         return ""
 
     def match_player(raw_name: str) -> str | None:
@@ -633,8 +570,6 @@ def extract_heatmap_from_boxcars(
                             car_pos[aid] = xy
                 elif kind == "pri":
                     actor_is_pri[aid] = True
-                elif kind == "ball":
-                    actor_is_ball[aid] = True
 
             for ua in fr.get("updated_actors") or []:
                 if not isinstance(ua, dict):
@@ -675,77 +610,29 @@ def extract_heatmap_from_boxcars(
                     actor_is_car[aid] = True
                     links_seen += 1
 
-                # RigidBody → car / ball physics
-                rb = _rigid_body_from_attribute(attr)
-                if rb is not None:
+                # RigidBody → car position
+                xy = _xy_from_attribute(attr)
+                if xy is not None:
                     rb_seen += 1
-                    loc = rb["location"]
-                    vel = rb["velocity"]
-                    is_ball = (
-                        actor_is_ball.get(aid)
-                        or "archetypes.ball" in oname_l
-                        or "ball_ta" in oname_l
-                        or (oname_l.endswith("ball") and "car" not in oname_l)
-                    )
-                    is_car = (
+                    if (
                         actor_is_car.get(aid)
                         or "replicatedrbstate" in oname_l
                         or "rbactor" in oname_l
-                        or "archetypes.car" in oname_l
-                    )
-                    if is_ball and not is_car:
-                        actor_is_ball[aid] = True
-                        ball_pos = loc
-                        ball_vel = vel
-                        ball_rb_seen += 1
-                    elif is_car or actor_is_car.get(aid):
+                    ):
                         actor_is_car[aid] = True
-                        car_pos[aid] = (loc[0], loc[1])
-                        car_pos3[aid] = loc
+                        car_pos[aid] = xy
 
             for da in fr.get("deleted_actors") or []:
                 did = _actor_id(da) if not isinstance(da, int) else da
                 if did is not None:
                     actor_is_car.pop(did, None)
-                    actor_is_ball.pop(did, None)
                     car_to_pri.pop(did, None)
                     car_pos.pop(did, None)
-                    car_pos3.pop(did, None)
                     actor_is_pri.pop(did, None)
+                    # keep pri_name[did] — recycled IDs still help late links
                     for k, v in list(pri_to_car.items()):
                         if v == did:
                             pri_to_car.pop(k, None)
-
-            # Record ball speed every frame (for goal lookup + kickoff)
-            if ball_vel is not None:
-                sp = _speed_uu(ball_vel)
-                ball_speed_by_frame[frame_count] = sp
-                if ball_pos is not None:
-                    ball_z_by_frame[frame_count] = ball_pos[2]
-                # Kickoff: first time ball leaves center with meaningful speed
-                if (
-                    kickoff_ball_moved_frame is None
-                    and frame_count < 350
-                    and ball_pos is not None
-                    and sp > 400
-                ):
-                    # near midfield at kickoff
-                    if abs(ball_pos[0]) < 500 and abs(ball_pos[1]) < 500:
-                        kickoff_ball_moved_frame = frame_count
-                        # closest car to ball = first touch proxy
-                        best_d = None
-                        best_name = None
-                        for caid, cxy in list(car_pos.items()):
-                            pri = car_to_pri.get(caid)
-                            pname = pri_name.get(pri) if pri is not None else pri_name.get(caid)
-                            if not pname:
-                                continue
-                            d = ((cxy[0] - ball_pos[0]) ** 2 + (cxy[1] - ball_pos[1]) ** 2) ** 0.5
-                            if best_d is None or d < best_d:
-                                best_d = d
-                                best_name = pname
-                        kickoff_first_car = best_name
-                        kickoff_first_dist = best_d
 
             # sample every 2nd frame (denser heatmaps)
             if frame_count % 2 != 0:
@@ -754,6 +641,7 @@ def extract_heatmap_from_boxcars(
                 pri = car_to_pri.get(caid)
                 pname = pri_name.get(pri) if pri is not None else None
                 if not pname:
+                    # reverse: this actor might itself be a known PRI with a car pos (rare)
                     pname = pri_name.get(caid)
                 if pname:
                     accumulate(pname, xy[0], xy[1])
@@ -777,47 +665,12 @@ def extract_heatmap_from_boxcars(
         mx = int(g.max()) if g.size else 0
         heatmaps[n] = {"cols": GRID, "rows": GRID, "cells": flat, "max": mx}
 
-    intel["ball_speed_by_frame"] = ball_speed_by_frame
-    intel["ball_z_by_frame"] = ball_z_by_frame
-    intel["kickoff"] = {
-        "ball_moved_frame": kickoff_ball_moved_frame,
-        "first_touch_player": kickoff_first_car,
-        "first_touch_dist": round(kickoff_first_dist, 1) if kickoff_first_dist is not None else None,
-    }
-    intel["ball_rb_samples"] = ball_rb_seen
-
     log(
-        f"  frames={frame_count} rb={rb_seen} ball_rb={ball_rb_seen} names={names_seen} links={links_seen} "
-        f"hits={hits} cars={len(actor_is_car)} pris={len(pri_name)} ball_speeds={len(ball_speed_by_frame)} "
+        f"  frames={frame_count} rb={rb_seen} names={names_seen} links={links_seen} "
+        f"hits={hits} cars={len(actor_is_car)} pris={len(pri_name)} "
         f"heat_max={[heatmaps[n]['max'] for n in player_names]}"
     )
-    return heatmaps, frame_count, intel
-
-
-def _lookup_ball_speed(intel: dict, frame_hint: Any) -> tuple[float | None, float | None, bool]:
-    """Nearest ball speed sample around a goal frame. Returns (speed_uu, speed_kmh, aerial)."""
-    speeds = intel.get("ball_speed_by_frame") or {}
-    zs = intel.get("ball_z_by_frame") or {}
-    if not speeds:
-        return None, None, False
-    try:
-        target = int(float(frame_hint))
-    except (TypeError, ValueError):
-        return None, None, False
-    # search nearest frame within ±45
-    best_f = None
-    best_d = 9999
-    for f in speeds.keys():
-        d = abs(int(f) - target)
-        if d < best_d:
-            best_d = d
-            best_f = int(f)
-    if best_f is None or best_d > 45:
-        return None, None, False
-    su = float(speeds[best_f])
-    z = float(zs.get(best_f) or 0)
-    aerial = z > 120  # ball clearly off ground
-    return round(su, 1), _speed_kmh(su), aerial
+    return heatmaps, frame_count
 
 
 def build_advanced(
@@ -826,7 +679,6 @@ def build_advanced(
     heatmaps: dict,
     frame_count: int,
     frames_ok: bool,
-    intel: dict | None = None,
 ) -> dict:
     players_out = []
     timeline = []
@@ -922,99 +774,22 @@ def build_advanced(
                 }
             )
 
-    intel = intel or {}
-    goal_speeds_all: list[dict] = []
-
     for g in details.get("goals") or []:
-        player = (
-            (g.get("player") or {}).get("name")
-            if isinstance(g.get("player"), dict)
-            else g.get("player")
+        timeline.append(
+            {
+                "t": g.get("frame_number") or g.get("time") or None,
+                "type": "goal",
+                "player": (
+                    (g.get("player") or {}).get("name")
+                    if isinstance(g.get("player"), dict)
+                    else g.get("player")
+                ),
+                "team": None,
+            }
         )
-        # ballchasing variants: frame / frame_number / time
-        frame_hint = (
-            g.get("frame_number")
-            or g.get("frame")
-            or g.get("time")
-            or g.get("time_seconds")
-        )
-        su, sk, aerial = _lookup_ball_speed(intel, frame_hint)
-        entry = {
-            "t": frame_hint,
-            "type": "goal",
-            "player": player,
-            "team": None,
-            "speed_uu": su,
-            "speed_kmh": sk,
-            "aerial": aerial,
-        }
-        timeline.append(entry)
-        if su is not None:
-            goal_speeds_all.append(
-                {
-                    "player": player,
-                    "frame": frame_hint,
-                    "speed_uu": su,
-                    "speed_kmh": sk,
-                    "aerial": aerial,
-                }
-            )
-
-    # Attach per-player goal events with speeds (one entry per scored goal when possible)
-    by_player: dict[str, list] = {}
-    for gs in goal_speeds_all:
-        p = gs.get("player") or ""
-        by_player.setdefault(p, []).append(gs)
-
-    for po in players_out:
-        name = po.get("name")
-        glist = by_player.get(name) or []
-        goals_n = int((po.get("stats_snapshot") or {}).get("goals") or 0)
-        if glist:
-            po["events"]["goals"] = [
-                {
-                    "t": g.get("frame"),
-                    "n": 1,
-                    "speed_uu": g.get("speed_uu"),
-                    "speed_kmh": g.get("speed_kmh"),
-                    "aerial": g.get("aerial"),
-                }
-                for g in glist
-            ]
-        elif goals_n:
-            po["events"]["goals"] = [{"t": None, "n": goals_n}]
-
-        # per-player goal speed summary
-        speeds = [g["speed_kmh"] for g in glist if g.get("speed_kmh") is not None]
-        if speeds:
-            po["stats_snapshot"]["goal_speed_max_kmh"] = max(speeds)
-            po["stats_snapshot"]["goal_speed_min_kmh"] = min(speeds)
-            po["stats_snapshot"]["goal_speed_avg_kmh"] = round(sum(speeds) / len(speeds), 1)
-            po["stats_snapshot"]["goals_aerial"] = sum(1 for g in glist if g.get("aerial"))
-            po["stats_snapshot"]["goals_ground"] = sum(1 for g in glist if not g.get("aerial"))
-
-    # Match-level goal speed aggregate
-    all_kmh = [g["speed_kmh"] for g in goal_speeds_all if g.get("speed_kmh") is not None]
-    goal_speed_summary = None
-    if all_kmh:
-        fastest = max(goal_speeds_all, key=lambda x: x.get("speed_kmh") or 0)
-        slowest = min(goal_speeds_all, key=lambda x: x.get("speed_kmh") or 9999)
-        goal_speed_summary = {
-            "count": len(all_kmh),
-            "max_kmh": max(all_kmh),
-            "min_kmh": min(all_kmh),
-            "avg_kmh": round(sum(all_kmh) / len(all_kmh), 1),
-            "fastest_player": fastest.get("player"),
-            "slowest_player": slowest.get("player"),
-            "aerial_pct": round(
-                100.0 * sum(1 for g in goal_speeds_all if g.get("aerial")) / len(goal_speeds_all), 1
-            ),
-        }
-
-    kickoff = intel.get("kickoff") or {}
 
     return {
-        "v": 2,
+        "v": 1,
         "replay_id": replay_id,
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "duration": duration,
@@ -1023,19 +798,11 @@ def build_advanced(
         "players": players_out,
         "timeline": timeline,
         "mistakes": mistakes,
-        "goal_speed": goal_speed_summary,
-        "kickoff": {
-            "first_touch_player": kickoff.get("first_touch_player"),
-            "ball_moved_frame": kickoff.get("ball_moved_frame"),
-            "first_touch_dist": kickoff.get("first_touch_dist"),
-        },
         "source": {
             "ballchasing": bool(details),
             "frames_parsed": frames_ok and frame_count > 0,
             "frame_count": frame_count,
             "boxcars": HAS_BOXCARS,
-            "ball_speed_samples": len(intel.get("ball_speed_by_frame") or {}),
-            "metrics": ["goal_speed", "kickoff_first_touch", "aerial_goal"],
         },
     }
 
@@ -1047,12 +814,10 @@ def process_one(replay_id: str) -> dict:
 
     path = download_replay(replay_id)
     raw = path.read_bytes()
-    heatmaps, frame_count, intel = extract_heatmap_from_boxcars(raw, names, replay_path=path)
+    heatmaps, frame_count = extract_heatmap_from_boxcars(raw, names, replay_path=path)
     frames_ok = frame_count > 0
 
-    advanced = build_advanced(
-        replay_id, details, heatmaps, frame_count, frames_ok, intel=intel
-    )
+    advanced = build_advanced(replay_id, details, heatmaps, frame_count, frames_ok)
 
     try:
         path.unlink(missing_ok=True)
