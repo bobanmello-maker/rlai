@@ -484,10 +484,13 @@ def extract_heatmap_from_boxcars(
     # reverse: PRI → car (latest)
     pri_to_car: dict[int, int] = {}
     actor_is_ball: dict[int, bool] = {}
+    # actor_id → archetype name from new_actors (needed: updated_actors object_id is the *attribute*)
+    actor_object_name: dict[int, str] = {}
     ball_pos: tuple[float, float, float] | None = None
     ball_vel: tuple[float, float, float] | None = None
     ball_speed_by_frame: dict[int, float] = {}
     ball_z_by_frame: dict[int, float] = {}
+    ball_pos_by_frame: dict[int, tuple[float, float, float]] = {}
     # kickoff: track early ball motion
     kickoff_ball_moved_frame: int | None = None
     kickoff_first_car: str | None = None
@@ -498,7 +501,9 @@ def extract_heatmap_from_boxcars(
     names_seen = 0
     links_seen = 0
     ball_rb_seen = 0
+    ball_actors_seen: set[int] = set()
     raw_names_found: set[str] = set()
+    debug_ball_obj_names: set[str] = set()
 
     def accumulate(name: str, x: float, y: float) -> None:
         nonlocal hits
@@ -521,12 +526,35 @@ def extract_heatmap_from_boxcars(
 
     def classify_object(oname: str) -> str:
         low = oname.lower()
-        # Prefer strict car archetype match
-        if "archetypes.car." in low or low.endswith("car_default") or "archetypes.car" in low:
+        # Prefer strict car archetype match (exclude car components)
+        if "carcomponent" in low or "specialpickup" in low:
+            return ""
+        if (
+            "archetypes.car." in low
+            or low.endswith("car_default")
+            or low == "tagame.car_ta"
+            or "archetypes.car" in low
+            or low.endswith(".car_ta")
+        ):
             return "car"
-        if "playerreplicationinfo" in low or "default__pri" in low or low.endswith("pri_ta"):
+        if (
+            "playerreplicationinfo" in low
+            or "default__pri" in low
+            or low.endswith("pri_ta")
+            or "tagame.pri_ta" in low
+        ):
             return "pri"
-        if "archetypes.ball" in low or "ball_ta" in low or low.endswith(".ball"):
+        # Ball archetypes: Archetypes.Ball.Ball_Default, Ball_Basketball, CubeBall, Ball_Breakout, …
+        # Also class names: TAGame.Ball_TA, TAGame.Ball_Breakout_TA, …
+        if (
+            "archetypes.ball" in low
+            or "ball_ta" in low
+            or low.endswith(".ball")
+            or low.startswith("tagame.ball")
+            or "cubeball" in low
+            or (".ball_" in low and "car" not in low and "component" not in low)
+            or (low.endswith("ball") and "car" not in low and "boost" not in low and "pickup" not in low)
+        ):
             return "ball"
         return ""
 
@@ -623,18 +651,29 @@ def extract_heatmap_from_boxcars(
                 oid = _obj_id(na.get("object_id") if "object_id" in na else na.get("object_ind"))
                 if aid is None:
                     continue
-                kind = classify_object(object_name(oid))
+                oname_spawn = object_name(oid)
+                if oname_spawn:
+                    actor_object_name[aid] = oname_spawn
+                kind = classify_object(oname_spawn)
+                traj = na.get("initial_trajectory") or {}
+                traj_loc = None
+                if isinstance(traj, dict):
+                    traj_loc = _vec3(traj.get("location") or traj.get("Location"))
                 if kind == "car":
                     actor_is_car[aid] = True
-                    traj = na.get("initial_trajectory") or {}
-                    if isinstance(traj, dict):
-                        xy = _xy_from_location(traj.get("location"))
-                        if xy:
-                            car_pos[aid] = xy
+                    if traj_loc:
+                        car_pos[aid] = (traj_loc[0], traj_loc[1])
+                        car_pos3[aid] = traj_loc
                 elif kind == "pri":
                     actor_is_pri[aid] = True
                 elif kind == "ball":
                     actor_is_ball[aid] = True
+                    ball_actors_seen.add(aid)
+                    if oname_spawn:
+                        debug_ball_obj_names.add(oname_spawn)
+                    if traj_loc:
+                        ball_pos = traj_loc
+                        ball_vel = (0.0, 0.0, 0.0)
 
             for ua in fr.get("updated_actors") or []:
                 if not isinstance(ua, dict):
@@ -676,25 +715,44 @@ def extract_heatmap_from_boxcars(
                     links_seen += 1
 
                 # RigidBody → car / ball physics
+                # NOTE: ua.object_id is the *attribute* stream (e.g. TAGame.RBActor_TA:ReplicatedRBState),
+                # NOT the actor archetype. Actor type must come from new_actors → actor_object_name.
                 rb = _rigid_body_from_attribute(attr)
                 if rb is not None:
                     rb_seen += 1
                     loc = rb["location"]
                     vel = rb["velocity"]
+                    arch = (actor_object_name.get(aid) or "").lower()
+                    arch_kind = classify_object(actor_object_name.get(aid) or "")
+
                     is_ball = (
                         actor_is_ball.get(aid)
-                        or "archetypes.ball" in oname_l
-                        or "ball_ta" in oname_l
-                        or (oname_l.endswith("ball") and "car" not in oname_l)
+                        or arch_kind == "ball"
+                        or "archetypes.ball" in arch
+                        or arch.startswith("tagame.ball")
+                        or ("ball" in arch and "car" not in arch and "component" not in arch and "pickup" not in arch)
                     )
                     is_car = (
                         actor_is_car.get(aid)
-                        or "replicatedrbstate" in oname_l
-                        or "rbactor" in oname_l
-                        or "archetypes.car" in oname_l
+                        or arch_kind == "car"
+                        or "archetypes.car" in arch
+                        or arch.endswith("car_ta")
+                        or ("car" in arch and "component" not in arch and "ball" not in arch)
                     )
+                    # Attribute-name fallback only when we still have no archetype mapping
+                    if not is_ball and not is_car and not arch:
+                        if "replicatedrbstate" in oname_l or "rbactor" in oname_l:
+                            # Unknown RB actor: prefer ball if near field center and no car link
+                            if aid not in car_to_pri and abs(loc[0]) < 4500 and abs(loc[1]) < 6000:
+                                is_ball = True
+                            else:
+                                is_car = True
+
                     if is_ball and not is_car:
                         actor_is_ball[aid] = True
+                        ball_actors_seen.add(aid)
+                        if arch:
+                            debug_ball_obj_names.add(actor_object_name.get(aid) or arch)
                         ball_pos = loc
                         ball_vel = vel
                         ball_rb_seen += 1
@@ -708,6 +766,7 @@ def extract_heatmap_from_boxcars(
                 if did is not None:
                     actor_is_car.pop(did, None)
                     actor_is_ball.pop(did, None)
+                    actor_object_name.pop(did, None)
                     car_to_pri.pop(did, None)
                     car_pos.pop(did, None)
                     car_pos3.pop(did, None)
@@ -716,21 +775,20 @@ def extract_heatmap_from_boxcars(
                         if v == did:
                             pri_to_car.pop(k, None)
 
-            # Record ball speed every frame (for goal lookup + kickoff)
-            if ball_vel is not None:
-                sp = _speed_uu(ball_vel)
+            # Record ball speed / position every frame (for goal lookup + kickoff)
+            if ball_pos is not None:
+                sp = _speed_uu(ball_vel) if ball_vel is not None else 0.0
                 ball_speed_by_frame[frame_count] = sp
-                if ball_pos is not None:
-                    ball_z_by_frame[frame_count] = ball_pos[2]
+                ball_z_by_frame[frame_count] = ball_pos[2]
+                ball_pos_by_frame[frame_count] = ball_pos
                 # Kickoff: first time ball leaves center with meaningful speed
                 if (
                     kickoff_ball_moved_frame is None
-                    and frame_count < 350
-                    and ball_pos is not None
-                    and sp > 400
+                    and frame_count < 400
+                    and sp > 350
                 ):
-                    # near midfield at kickoff
-                    if abs(ball_pos[0]) < 500 and abs(ball_pos[1]) < 500:
+                    # near midfield at kickoff (slightly wider window)
+                    if abs(ball_pos[0]) < 800 and abs(ball_pos[1]) < 800:
                         kickoff_ball_moved_frame = frame_count
                         # closest car to ball = first touch proxy
                         best_d = None
@@ -779,45 +837,84 @@ def extract_heatmap_from_boxcars(
 
     intel["ball_speed_by_frame"] = ball_speed_by_frame
     intel["ball_z_by_frame"] = ball_z_by_frame
+    intel["ball_pos_by_frame"] = ball_pos_by_frame
     intel["kickoff"] = {
         "ball_moved_frame": kickoff_ball_moved_frame,
         "first_touch_player": kickoff_first_car,
         "first_touch_dist": round(kickoff_first_dist, 1) if kickoff_first_dist is not None else None,
     }
     intel["ball_rb_samples"] = ball_rb_seen
+    intel["ball_actor_ids"] = sorted(ball_actors_seen)
 
     log(
         f"  frames={frame_count} rb={rb_seen} ball_rb={ball_rb_seen} names={names_seen} links={links_seen} "
         f"hits={hits} cars={len(actor_is_car)} pris={len(pri_name)} ball_speeds={len(ball_speed_by_frame)} "
-        f"heat_max={[heatmaps[n]['max'] for n in player_names]}"
+        f"ball_actors={len(ball_actors_seen)} heat_max={[heatmaps[n]['max'] for n in player_names]}"
     )
+    if ball_rb_seen == 0:
+        # Help diagnose missing ball: sample object names that look related
+        sample_objs = [str(o) for o in objects if o and "ball" in str(o).lower()][:12]
+        log(
+            f"  warn: no ball RB — ball_obj_names={list(debug_ball_obj_names)[:8]} "
+            f"objects_with_ball={sample_objs}"
+        )
     return heatmaps, frame_count, intel
 
 
 def _lookup_ball_speed(intel: dict, frame_hint: Any) -> tuple[float | None, float | None, bool]:
-    """Nearest ball speed sample around a goal frame. Returns (speed_uu, speed_kmh, aerial)."""
+    """Nearest ball speed sample around a goal frame. Returns (speed_uu, speed_kmh, aerial).
+
+    frame_hint may be network frame index or (rarely) time in seconds — we try both.
+    Prefer the *maximum* speed in a small window before the goal (ball is fastest just
+    before crossing the line, then may slow on post/ground contact).
+    """
     speeds = intel.get("ball_speed_by_frame") or {}
     zs = intel.get("ball_z_by_frame") or {}
     if not speeds:
         return None, None, False
     try:
-        target = int(float(frame_hint))
+        target = float(frame_hint)
     except (TypeError, ValueError):
         return None, None, False
-    # search nearest frame within ±45
-    best_f = None
-    best_d = 9999
+
+    candidates: list[int] = []
+    # Direct frame index (Ballchasing / header Goals usually give frame numbers)
+    t_frame = int(target)
+    # Also try ~30 fps conversion if hint looks like seconds (small number)
+    t_from_sec = int(round(target * 30.0)) if target < 900 else None
+
     for f in speeds.keys():
-        d = abs(int(f) - target)
-        if d < best_d:
-            best_d = d
-            best_f = int(f)
-    if best_f is None or best_d > 45:
+        fi = int(f)
+        if abs(fi - t_frame) <= 60:
+            candidates.append(fi)
+        elif t_from_sec is not None and abs(fi - t_from_sec) <= 60:
+            candidates.append(fi)
+
+    if not candidates:
+        # fallback: nearest any frame within ±90
+        best_f = None
+        best_d = 9999
+        for f in speeds.keys():
+            d = abs(int(f) - t_frame)
+            if d < best_d:
+                best_d = d
+                best_f = int(f)
+        if best_f is None or best_d > 90:
+            return None, None, False
+        candidates = [best_f]
+
+    # Prefer peak speed in the window (shot speed), ignore near-zero
+    best_su = -1.0
+    best_z = 0.0
+    for fi in candidates:
+        su = float(speeds.get(fi) or 0)
+        if su > best_su:
+            best_su = su
+            best_z = float(zs.get(fi) or 0)
+    if best_su < 0:
         return None, None, False
-    su = float(speeds[best_f])
-    z = float(zs.get(best_f) or 0)
-    aerial = z > 120  # ball clearly off ground
-    return round(su, 1), _speed_kmh(su), aerial
+    aerial = best_z > 120  # ball clearly off ground (~ ball radius + margin)
+    return round(best_su, 1), _speed_kmh(best_su), aerial
 
 
 def build_advanced(
@@ -1013,6 +1110,25 @@ def build_advanced(
 
     kickoff = intel.get("kickoff") or {}
 
+    # Match-level ball motion summary (independent of goals)
+    ball_speeds_all = list((intel.get("ball_speed_by_frame") or {}).values())
+    ball_zs = list((intel.get("ball_z_by_frame") or {}).values())
+    ball_motion = None
+    if ball_speeds_all:
+        max_sp = max(ball_speeds_all)
+        ball_motion = {
+            "samples": len(ball_speeds_all),
+            "max_speed_uu": round(max_sp, 1),
+            "max_speed_kmh": _speed_kmh(max_sp),
+            "avg_speed_kmh": _speed_kmh(sum(ball_speeds_all) / len(ball_speeds_all)),
+            "max_height_uu": round(max(ball_zs), 1) if ball_zs else None,
+            "air_pct": round(
+                100.0 * sum(1 for z in ball_zs if z > 120) / max(1, len(ball_zs)), 1
+            )
+            if ball_zs
+            else None,
+        }
+
     return {
         "v": 2,
         "replay_id": replay_id,
@@ -1024,6 +1140,7 @@ def build_advanced(
         "timeline": timeline,
         "mistakes": mistakes,
         "goal_speed": goal_speed_summary,
+        "ball_motion": ball_motion,
         "kickoff": {
             "first_touch_player": kickoff.get("first_touch_player"),
             "ball_moved_frame": kickoff.get("ball_moved_frame"),
@@ -1035,7 +1152,13 @@ def build_advanced(
             "frame_count": frame_count,
             "boxcars": HAS_BOXCARS,
             "ball_speed_samples": len(intel.get("ball_speed_by_frame") or {}),
-            "metrics": ["goal_speed", "kickoff_first_touch", "aerial_goal"],
+            "ball_rb_samples": int(intel.get("ball_rb_samples") or 0),
+            "metrics": [
+                "goal_speed",
+                "kickoff_first_touch",
+                "aerial_goal",
+                "ball_motion",
+            ],
         },
     }
 
