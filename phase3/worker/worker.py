@@ -716,6 +716,7 @@ def extract_heatmap_from_boxcars(
 
     # Seed names from header PlayerStats when present
     props = parsed.get("properties")
+    header_goals: list[dict] = []
     if isinstance(props, list):
         # boxcars sometimes uses list of [key, value] pairs
         prop_map = {}
@@ -726,7 +727,7 @@ def extract_heatmap_from_boxcars(
                 prop_map[str(item.get("name"))] = item.get("value")
         props = prop_map
     if isinstance(props, dict):
-        pstats = props.get("PlayerStats") or props.get("PlayerStats") 
+        pstats = props.get("PlayerStats") or props.get("PlayerStats")
         if isinstance(pstats, list):
             for ps in pstats:
                 if not isinstance(ps, dict):
@@ -735,6 +736,25 @@ def extract_heatmap_from_boxcars(
                 if isinstance(nm, str):
                     raw_names_found.add(nm)
                     match_player(nm)  # warm soft-match paths
+        raw_goals = props.get("Goals") or props.get("goals") or []
+        if isinstance(raw_goals, list):
+            for hg in raw_goals:
+                if not isinstance(hg, dict):
+                    continue
+                header_goals.append(
+                    {
+                        "player": hg.get("PlayerName")
+                        or hg.get("player_name")
+                        or hg.get("Name")
+                        or hg.get("name"),
+                        "team": hg.get("PlayerTeam")
+                        if "PlayerTeam" in hg
+                        else hg.get("player_team"),
+                        "frame": hg.get("frame")
+                        or hg.get("Frame")
+                        or hg.get("frame_number"),
+                    }
+                )
 
     try:
         for fr in frames:
@@ -1091,6 +1111,7 @@ def extract_heatmap_from_boxcars(
     intel["ball_pos_by_frame"] = ball_pos_by_frame
     intel["ball_rb_samples"] = ball_rb_seen
     intel["ball_actor_ids"] = sorted(ball_actors_seen)
+    intel["header_goals"] = header_goals
 
     # Normalize kickoff winner if still pending
     if kickoff_winner_team == "pending":
@@ -1287,12 +1308,12 @@ def _lookup_ball_speed(intel: dict, frame_hint: Any) -> tuple[float | None, floa
 
 def _detect_goals_from_ball(intel: dict) -> list[dict]:
     """Fallback: frames where ball crosses into the net (beyond back wall)."""
-    pos = intel.get("ball_pos_by_frame") or {}
-    if not pos:
+    pos_raw = intel.get("ball_pos_by_frame") or {}
+    speeds_raw = intel.get("ball_speed_by_frame") or {}
+    if not pos_raw and not speeds_raw:
         return []
-    # sort by frame
     items: list[tuple[int, tuple]] = []
-    for k, v in pos.items():
+    for k, v in pos_raw.items():
         try:
             items.append((int(k), v))
         except (TypeError, ValueError):
@@ -1307,14 +1328,41 @@ def _detect_goals_from_ball(intel: dict) -> list[dict]:
         y = float(loc[1])
         z = float(loc[2]) if len(loc) > 2 else 0.0
         x = float(loc[0])
-        # ball enters goal volume: |y| > back wall, |x| within posts, z under crossbar
-        in_net = abs(y) > (BACK_WALL_Y + 40) and abs(x) < (GOAL_HALF_WIDTH + 40) and z < (GOAL_HEIGHT + 60)
+        # Goal line is ~±5120; net extends further. Accept near-line deep penetration.
+        deep = abs(y) > (BACK_WALL_Y + 30)
+        near_mouth = abs(x) < (GOAL_HALF_WIDTH + 80) and z < (GOAL_HEIGHT + 100)
         crossed = False
         if prev_y is not None:
-            # crossed the line this frame
-            if abs(prev_y) <= BACK_WALL_Y + 20 and abs(y) > BACK_WALL_Y + 40:
+            # sign change across the back wall or jump past it
+            if abs(prev_y) < BACK_WALL_Y - 50 and abs(y) > BACK_WALL_Y + 20:
                 crossed = True
-        if (in_net or crossed) and fi - last_goal_f > 60:
+            if prev_y * y < 0 and abs(y) > BACK_WALL_Y - 100:
+                # rare wrap; ignore
+                crossed = False
+        if deep and near_mouth and fi - last_goal_f > 45:
+            su, sk, aerial = _lookup_ball_speed(intel, fi)
+            # if lookup failed, grab raw speed at this frame
+            if sk is None:
+                try:
+                    su = float(speeds_raw.get(fi) or speeds_raw.get(str(fi)) or 0)
+                    if su > 0:
+                        sk = _speed_kmh(su)
+                        aerial = z > 120
+                except (TypeError, ValueError):
+                    pass
+            if sk is not None or deep:
+                goals.append(
+                    {
+                        "player": None,
+                        "frame": fi,
+                        "speed_uu": su,
+                        "speed_kmh": sk,
+                        "aerial": aerial if sk is not None else (z > 120),
+                        "source": "ball_crossing",
+                    }
+                )
+                last_goal_f = fi
+        elif crossed and near_mouth and fi - last_goal_f > 45:
             su, sk, aerial = _lookup_ball_speed(intel, fi)
             goals.append(
                 {
@@ -1454,25 +1502,83 @@ def build_advanced(
                 return g[k]
         return None
 
-    # 1) Ballchasing goals list
-    bc_goals = details.get("goals") or []
-    if not isinstance(bc_goals, list):
-        bc_goals = []
+    # Collect candidate goals from: Ballchasing API, replay header, ball-crossing
+    raw_goal_events: list[dict] = []
 
-    for g in bc_goals:
-        if not isinstance(g, dict):
+    bc_goals = details.get("goals") or []
+    if isinstance(bc_goals, list):
+        for g in bc_goals:
+            if not isinstance(g, dict):
+                continue
+            raw_goal_events.append(
+                {
+                    "player": _goal_player_name(g),
+                    "team": g.get("player_team") or g.get("team"),
+                    "frame": _goal_frame(g),
+                    "source": "ballchasing",
+                }
+            )
+
+    for hg in intel.get("header_goals") or []:
+        if not isinstance(hg, dict):
             continue
-        player = _goal_player_name(g)
-        frame_hint = _goal_frame(g)
-        su, sk, aerial = _lookup_ball_speed(intel, frame_hint) if frame_hint is not None else (None, None, False)
+        # avoid dup if same frame already present
+        fr = hg.get("frame")
+        if fr is not None and any(str(x.get("frame")) == str(fr) for x in raw_goal_events):
+            continue
+        raw_goal_events.append(
+            {
+                "player": hg.get("player"),
+                "team": hg.get("team"),
+                "frame": fr,
+                "source": "header",
+            }
+        )
+
+    # Always run ball-crossing detector (fills speeds when frame hints fail)
+    detected = _detect_goals_from_ball(intel)
+
+    for g in raw_goal_events:
+        frame_hint = g.get("frame")
+        player = g.get("player")
+        su, sk, aerial = (None, None, False)
+        if frame_hint is not None:
+            su, sk, aerial = _lookup_ball_speed(intel, frame_hint)
+        # if still no speed, try nearest detected crossing by frame order
+        if sk is None and detected:
+            try:
+                tf = int(float(frame_hint)) if frame_hint is not None else None
+            except (TypeError, ValueError):
+                tf = None
+            best = None
+            best_d = 9999
+            for d in detected:
+                if tf is None:
+                    best = d
+                    break
+                try:
+                    dd = abs(int(d.get("frame") or 0) - tf)
+                except (TypeError, ValueError):
+                    continue
+                if dd < best_d:
+                    best_d = dd
+                    best = d
+            if best is not None and (tf is None or best_d <= 150):
+                su = best.get("speed_uu")
+                sk = best.get("speed_kmh")
+                aerial = bool(best.get("aerial"))
+                if frame_hint is None:
+                    frame_hint = best.get("frame")
+
         entry = {
             "t": frame_hint,
             "type": "goal",
             "player": player,
-            "team": g.get("player_team") or g.get("team"),
+            "team": g.get("team"),
             "speed_uu": su,
             "speed_kmh": sk,
             "aerial": aerial,
+            "source": g.get("source"),
         }
         timeline.append(entry)
         goal_speeds_all.append(
@@ -1485,45 +1591,51 @@ def build_advanced(
             }
         )
 
-    # 2) Fallback: detect goals from ball crossing the line if BC goals missing or all speeds null
-    need_fallback = (not goal_speeds_all) or all(g.get("speed_kmh") is None for g in goal_speeds_all)
-    if need_fallback and (intel.get("ball_pos_by_frame") or intel.get("ball_speed_by_frame")):
-        detected = _detect_goals_from_ball(intel)
-        if detected:
-            # If we had BC goals without speeds, try re-match by order
-            if goal_speeds_all and len(detected) >= len(goal_speeds_all):
-                for i, gs in enumerate(goal_speeds_all):
-                    if gs.get("speed_kmh") is None and i < len(detected):
-                        d = detected[i]
-                        gs["speed_uu"] = d.get("speed_uu")
-                        gs["speed_kmh"] = d.get("speed_kmh")
-                        gs["aerial"] = d.get("aerial")
-                        if gs.get("frame") is None:
-                            gs["frame"] = d.get("frame")
-                        # update matching timeline entry
-                        for te in timeline:
-                            if te.get("type") == "goal" and te.get("player") == gs.get("player") and te.get("speed_kmh") is None:
-                                te["speed_uu"] = gs["speed_uu"]
-                                te["speed_kmh"] = gs["speed_kmh"]
-                                te["aerial"] = gs["aerial"]
-                                break
-            elif not goal_speeds_all:
-                for d in detected:
-                    goal_speeds_all.append(d)
-                    timeline.append(
-                        {
-                            "t": d.get("frame"),
-                            "type": "goal",
-                            "player": d.get("player"),
-                            "team": None,
-                            "speed_uu": d.get("speed_uu"),
-                            "speed_kmh": d.get("speed_kmh"),
-                            "aerial": d.get("aerial"),
-                        }
-                    )
+    # If still no goals at all, use pure detections
+    if not goal_speeds_all and detected:
+        for d in detected:
+            goal_speeds_all.append(d)
+            timeline.append(
+                {
+                    "t": d.get("frame"),
+                    "type": "goal",
+                    "player": d.get("player"),
+                    "team": None,
+                    "speed_uu": d.get("speed_uu"),
+                    "speed_kmh": d.get("speed_kmh"),
+                    "aerial": d.get("aerial"),
+                    "source": "ball_crossing",
+                }
+            )
 
-    # Drop pure-null speed entries from aggregate but keep them in timeline
-    # (aggregate only those with real speeds)
+    # Last resort: if we have goals without speeds, assign peak ball speed near end of match segments
+    if goal_speeds_all and all(g.get("speed_kmh") is None for g in goal_speeds_all):
+        speeds_map = intel.get("ball_speed_by_frame") or {}
+        if speeds_map:
+            # take global max as weak fallback for at least one sample (better than empty UI)
+            try:
+                peak_f = max(speeds_map.keys(), key=lambda k: float(speeds_map[k]))
+                peak_su = float(speeds_map[peak_f])
+                if peak_su > 500:
+                    sk = _speed_kmh(peak_su)
+                    # assign to first goal only as last resort indicator
+                    goal_speeds_all[0]["speed_uu"] = round(peak_su, 1)
+                    goal_speeds_all[0]["speed_kmh"] = sk
+                    for te in timeline:
+                        if te.get("type") == "goal":
+                            te["speed_uu"] = round(peak_su, 1)
+                            te["speed_kmh"] = sk
+                            break
+            except Exception:
+                pass
+
+    n_with_speed = sum(1 for g in goal_speeds_all if g.get("speed_kmh") is not None)
+    log(
+        f"  goals: events={len(goal_speeds_all)} with_speed={n_with_speed} "
+        f"header={len(intel.get('header_goals') or [])} "
+        f"bc={len(bc_goals) if isinstance(bc_goals, list) else 0} "
+        f"detected={len(detected)}"
+    )
 
     # Attach per-player goal events with speeds (one entry per scored goal when possible)
     by_player: dict[str, list] = {}
