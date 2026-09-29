@@ -588,11 +588,12 @@ def extract_heatmap_from_boxcars(
     # shadow when last defender: sum of dist-to-ball / count
     shadow_sum: dict[str, float] = {n: 0.0 for n in player_names}
     shadow_n: dict[str, int] = {n: 0 for n in player_names}
-    # post / crossbar hits (match-level + per last-touch player)
+    # post / crossbar hits (match-level)
     post_hits = 0
     crossbar_hits = 0
-    post_hits_by_player: dict[str, int] = {n: 0 for n in player_names}
-    crossbar_hits_by_player: dict[str, int] = {n: 0 for n in player_names}
+    # per-player attribution: player whose touch was last before the ball hit the frame
+    post_by: dict[str, int] = {n: 0 for n in player_names}
+    bar_by: dict[str, int] = {n: 0 for n in player_names}
     # demos detected via attribute name
     demos: list[dict] = []  # {frame, victim?, attacker?}
     prev_ball_vel: tuple[float, float, float] | None = None
@@ -926,22 +927,19 @@ def extract_heatmap_from_boxcars(
                     vy0, vy1 = prev_ball_vel[1], ball_vel[1]
                     # bounce: Y velocity flips sign near the line
                     if vy0 * vy1 < 0 and abs(vy0) > 200:
-                        # Attribute to last touch player if touch was recent (~3s)
-                        touch_owner = None
-                        if (
+                        shooter = (
                             last_touch_player
-                            and last_touch_player in post_hits_by_player
-                            and (frame_count - last_touch_frame) <= 90
-                        ):
-                            touch_owner = last_touch_player
+                            if last_touch_player in post_by and frame_count - last_touch_frame <= 240
+                            else None
+                        )
                         if abs(abs(bx) - GOAL_HALF_WIDTH) < POST_HIT_XY_MARGIN and bz < GOAL_HEIGHT + 50:
                             post_hits += 1
-                            if touch_owner:
-                                post_hits_by_player[touch_owner] = post_hits_by_player.get(touch_owner, 0) + 1
+                            if shooter:
+                                post_by[shooter] += 1
                         elif CROSSBAR_Z_LO <= bz <= CROSSBAR_Z_HI and abs(bx) < GOAL_HALF_WIDTH + 50:
                             crossbar_hits += 1
-                            if touch_owner:
-                                crossbar_hits_by_player[touch_owner] = crossbar_hits_by_player.get(touch_owner, 0) + 1
+                            if shooter:
+                                bar_by[shooter] += 1
 
                 # ── Touches & challenges ──────────────────────────────────
                 near_cars: list[tuple[str, str, float]] = []  # name, team, dist
@@ -1142,6 +1140,18 @@ def extract_heatmap_from_boxcars(
         else None,
     }
 
+    # Passes per player (consecutive touches, different players, same team)
+    passes_made: dict[str, int] = {n: 0 for n in player_names}
+    passes_recv: dict[str, int] = {n: 0 for n in player_names}
+    for i in range(1, len(touches)):
+        f0, p0, t0 = touches[i - 1]
+        f1, p1, t1 = touches[i]
+        if t0 and t0 == t1 and p0 != p1 and (f1 - f0) < 150:
+            if p0 in passes_made:
+                passes_made[p0] += 1
+            if p1 in passes_recv:
+                passes_recv[p1] += 1
+
     # Per-player advanced
     per_player: dict[str, dict] = {}
     for n in player_names:
@@ -1167,6 +1177,10 @@ def extract_heatmap_from_boxcars(
             "boost_big": big_picks,
             "boost_small": small_picks,
             "boost_total": big_picks + small_picks,
+            "post_hits": post_by.get(n) or 0,
+            "crossbar_hits": bar_by.get(n) or 0,
+            "passes_made": passes_made.get(n) or 0,
+            "passes_received": passes_recv.get(n) or 0,
         }
     intel["per_player"] = per_player
 
@@ -1213,8 +1227,6 @@ def extract_heatmap_from_boxcars(
     intel["touches"] = [{"frame": f, "player": p, "team": t} for f, p, t in touches]
     intel["post_hits"] = post_hits
     intel["crossbar_hits"] = crossbar_hits
-    intel["post_hits_by_player"] = dict(post_hits_by_player)
-    intel["crossbar_hits_by_player"] = dict(crossbar_hits_by_player)
     intel["demos_detected"] = demos[:50]  # cap
     intel["demo_count"] = len(demos)
 
@@ -1370,6 +1382,7 @@ def _detect_goals_from_ball(intel: dict) -> list[dict]:
                 goals.append(
                     {
                         "player": None,
+                        "team": "blue" if y > 0 else "orange",
                         "frame": fi,
                         "speed_uu": su,
                         "speed_kmh": sk,
@@ -1383,6 +1396,7 @@ def _detect_goals_from_ball(intel: dict) -> list[dict]:
             goals.append(
                 {
                     "player": None,
+                    "team": "blue" if y > 0 else "orange",
                     "frame": fi,
                     "speed_uu": su,
                     "speed_kmh": sk,
@@ -1393,6 +1407,85 @@ def _detect_goals_from_ball(intel: dict) -> list[dict]:
             last_goal_f = fi
         prev_y = y
     return goals
+
+
+def _team_label(t: Any) -> str | None:
+    """Normalize team markers (0/1, '0'/'1', 'blue'/'orange') to 'blue' | 'orange'."""
+    if isinstance(t, bool):
+        return None
+    if t in (0, "0"):
+        return "blue"
+    if t in (1, "1"):
+        return "orange"
+    if isinstance(t, str):
+        tl = t.strip().lower()
+        if tl in ("blue", "orange"):
+            return tl
+    return None
+
+
+def _name_base(n: Any) -> str:
+    """Folded alnum name without trailing '(N)' duplicate suffix."""
+    raw = re.sub(r"\(\d+\)\s*$", "", str(n or "").strip())
+    return "".join(ch for ch in _fold_name(raw) if ch.isalnum())
+
+
+def _last_touch(touches: list[dict], frame: Any, team: str | None, window: int = 900) -> dict | None:
+    """Last ball touch at or shortly before `frame`, optionally restricted to `team`."""
+    try:
+        f = int(float(frame))
+    except (TypeError, ValueError):
+        return None
+    best = None
+    for t in touches:
+        try:
+            tf = int(t.get("frame"))
+        except (TypeError, ValueError):
+            continue
+        if tf > f + 8:
+            break
+        if f - tf > window:
+            continue
+        if team and _team_label(t.get("team")) != team:
+            continue
+        best = t
+    return best
+
+
+def _resolve_goal_player(
+    raw: str | None,
+    team: Any,
+    frame: Any,
+    players_out: list[dict],
+    touches: list[dict],
+) -> tuple[str | None, str | None]:
+    """Map a goal to a canonical player name from players_out.
+
+    Offline / split-screen replays give several players the *same* base name
+    (ExMirage, ExMirage(1), ...), so the header name alone is ambiguous there.
+    In that case (or when there is no name at all) fall back to the last touch
+    by the scoring team right before the goal frame.
+    Returns (player_name_or_None, how) where how is 'name' | 'touch' | None.
+    """
+    names = [p.get("name") for p in players_out if p.get("name")]
+    tl = _team_label(team)
+    cands: list[str] = []
+    if raw:
+        base = _name_base(raw)
+        cands = [n for n in names if _name_base(n) == base]
+        if len(cands) == 1:
+            return cands[0], "name"
+        if raw in names and len(cands) > 1 and re.search(r"\(\d+\)\s*$", str(raw)):
+            return raw, "name"
+    lt = _last_touch(touches, frame, tl)
+    if lt and lt.get("player") in names:
+        # if the header name narrowed things down, respect that
+        if not cands or lt.get("player") in cands:
+            return lt.get("player"), "touch"
+    if raw and not cands:
+        return raw, "name"  # unknown name (e.g. opponent not in players_out)
+    return None, None
+
 
 
 def build_advanced(
@@ -1586,10 +1679,14 @@ def build_advanced(
                 if frame_hint is None:
                     frame_hint = best.get("frame")
 
+        player, attr_how = _resolve_goal_player(
+            player, g.get("team"), frame_hint, players_out, intel.get("touches") or []
+        )
         entry = {
             "t": frame_hint,
             "type": "goal",
             "player": player,
+            "attribution": attr_how,
             "team": g.get("team"),
             "speed_uu": su,
             "speed_kmh": sk,
@@ -1610,13 +1707,18 @@ def build_advanced(
     # If still no goals at all, use pure detections
     if not goal_speeds_all and detected:
         for d in detected:
+            d_player, d_how = _resolve_goal_player(
+                d.get("player"), d.get("team"), d.get("frame"), players_out, intel.get("touches") or []
+            )
+            d["player"] = d_player
             goal_speeds_all.append(d)
             timeline.append(
                 {
                     "t": d.get("frame"),
                     "type": "goal",
-                    "player": d.get("player"),
-                    "team": None,
+                    "player": d_player,
+                    "attribution": d_how,
+                    "team": d.get("team"),
                     "speed_uu": d.get("speed_uu"),
                     "speed_kmh": d.get("speed_kmh"),
                     "aerial": d.get("aerial"),
@@ -1644,6 +1746,34 @@ def build_advanced(
                             break
             except Exception:
                 pass
+
+    # Reconcile with per-player goal counts from stats: an unattributed goal of a
+    # team goes to a teammate who scored more (per stats) than we attributed.
+    goal_entries = [e for e in timeline if e.get("type") == "goal"]
+    need = {
+        p["name"]: int((p.get("stats_snapshot") or {}).get("goals") or 0) for p in players_out
+    }
+    have: dict[str, int] = {}
+    for e in goal_entries:
+        if e.get("player") in need:
+            have[e["player"]] = have.get(e["player"], 0) + 1
+    for e, g in zip(goal_entries, goal_speeds_all):
+        if e.get("player"):
+            continue
+        tl = _team_label(e.get("team"))
+        if not tl:
+            continue
+        cands = [
+            p["name"]
+            for p in players_out
+            if _team_label(p.get("team")) == tl and need[p["name"]] - have.get(p["name"], 0) > 0
+        ]
+        if cands:
+            pick = max(cands, key=lambda n: need[n] - have.get(n, 0))
+            e["player"] = pick
+            e["attribution"] = "stats"
+            g["player"] = pick
+            have[pick] = have.get(pick, 0) + 1
 
     n_with_speed = sum(1 for g in goal_speeds_all if g.get("speed_kmh") is not None)
     log(
@@ -1707,6 +1837,18 @@ def build_advanced(
     kickoff = intel.get("kickoff") or {}
     per_player_intel = intel.get("per_player") or {}
 
+    # Demo -> goal per scorer: goals this player scored with any demo in the 90 frames before
+    demo_frames_pp = [d.get("frame") for d in (intel.get("demos_detected") or []) if d.get("frame")]
+    demo_goals_by: dict[str, int] = {}
+    for g in goal_speeds_all:
+        try:
+            gf_ = int(float(g.get("frame")))
+        except (TypeError, ValueError):
+            continue
+        scorer = g.get("player") or ""
+        if scorer and any(gf_ - 90 <= df <= gf_ for df in demo_frames_pp if isinstance(df, int)):
+            demo_goals_by[scorer] = demo_goals_by.get(scorer, 0) + 1
+
     # Attach per-player advanced stats
     for po in players_out:
         adv = per_player_intel.get(po["name"]) or {}
@@ -1721,6 +1863,11 @@ def build_advanced(
             "boost_small": adv.get("boost_small"),
             "boost_total": adv.get("boost_total"),
             "boost_pads": adv.get("boost_pads"),
+            "post_hits": adv.get("post_hits"),
+            "crossbar_hits": adv.get("crossbar_hits"),
+            "passes_made": adv.get("passes_made"),
+            "passes_received": adv.get("passes_received"),
+            "demo_goals": demo_goals_by.get(po["name"], 0),
         }
         # also mirror key fields into stats_snapshot for UI convenience
         snap = po.get("stats_snapshot") or {}
@@ -1756,50 +1903,15 @@ def build_advanced(
         }
 
     # Demo before goal: any demo in the 90 frames before each goal
-    # Match-level count + per-scorer (player who scored after a demo)
-    demo_frames = []
-    for d in intel.get("demos_detected") or []:
-        try:
-            demo_frames.append(int(d.get("frame")))
-        except (TypeError, ValueError):
-            continue
+    demo_frames = [d.get("frame") for d in (intel.get("demos_detected") or []) if d.get("frame")]
     goals_with_demo_before = 0
-    goals_with_demo_before_by_player: dict[str, int] = {}
     for g in goal_speeds_all:
         try:
             gf = int(float(g.get("frame")))
         except (TypeError, ValueError):
             continue
-        if any(gf - 90 <= df <= gf for df in demo_frames):
+        if any(gf - 90 <= df <= gf for df in demo_frames if isinstance(df, int)):
             goals_with_demo_before += 1
-            scorer = g.get("player") or ""
-            if scorer:
-                goals_with_demo_before_by_player[scorer] = (
-                    goals_with_demo_before_by_player.get(scorer, 0) + 1
-                )
-
-    # Per-player post / crossbar / demo→goal into stats_snapshot
-    post_by = intel.get("post_hits_by_player") or {}
-    bar_by = intel.get("crossbar_hits_by_player") or {}
-    for po in players_out:
-        name = po.get("name") or ""
-        snap = po.get("stats_snapshot") or {}
-        ph = int(post_by.get(name) or 0)
-        bh = int(bar_by.get(name) or 0)
-        dbg = int(goals_with_demo_before_by_player.get(name) or 0)
-        snap["post_hits"] = ph
-        snap["crossbar_hits"] = bh
-        snap["goals_with_demo_before"] = dbg
-        # demos inflicted/taken from Ballchasing events (already on events)
-        dem_inf = 0
-        dem_taken = 0
-        for ev in (po.get("events") or {}).get("demos_inflicted") or []:
-            dem_inf += int(ev.get("n") or 0)
-        for ev in (po.get("events") or {}).get("demos_taken") or []:
-            dem_taken += int(ev.get("n") or 0)
-        snap["demos_inflicted"] = dem_inf
-        snap["demos_taken"] = dem_taken
-        po["stats_snapshot"] = snap
 
     # Air % at goal (ball Z already used for aerial flag)
     aerial_goals = sum(1 for g in goal_speeds_all if g.get("aerial"))
@@ -1837,6 +1949,8 @@ def build_advanced(
 
     return {
         "v": 3,
+        "goal_model": 2,  # 2 = goals attributed per player (touch/stats fallback)
+        "attr_v": 1,  # 1 = post/crossbar/passes/demo-goal attributed per player
         "replay_id": replay_id,
         "processed_at": datetime.now(timezone.utc).isoformat(),
         "duration": duration,
@@ -1860,10 +1974,7 @@ def build_advanced(
         "demos": {
             "detected": intel.get("demo_count") or 0,
             "goals_with_demo_before": goals_with_demo_before,
-            "goals_with_demo_before_by_player": goals_with_demo_before_by_player,
         },
-        "post_hits_by_player": intel.get("post_hits_by_player") or {},
-        "crossbar_hits_by_player": intel.get("crossbar_hits_by_player") or {},
         "possession": poss_summary,
         "passes": pass_summary,
         "goals_air": {
@@ -1897,6 +2008,7 @@ def build_advanced(
                 "passes",
                 "post_crossbar",
                 "demo_before_goal",
+                "player_attribution",
                 "boost_pads",
             ],
         },
